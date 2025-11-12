@@ -1,0 +1,294 @@
+// Configuration
+// PC--[USB]--KAW[S] <---[WiFi/UDP]--> KAW[C]
+
+#include <M5Unified.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <Ticker.h>
+
+// Device type constants
+#define SERVER 1
+#define CLIENT 2
+
+// Wireless communication method constants
+#define ESPNOW 1
+#define WIFI_UDP 2
+#define WIFI_TCP 3
+
+//-------------------------
+// Wireless communication method selection: ESPNOW, WIFI_UDP, or WIFI_TCP
+//#define WIRELESS WIFI_UDP
+//#define WIRELESS WIFI_TCP
+#define WIRELESS ESPNOW
+
+// Device type selection: SERVER or CLIENT
+#define TYPE SERVER
+//#define TYPE CLIENT
+
+#define CLIENT_ID 1 // client(sernsor)'s ID 
+//-------------------------
+
+// Define symbols for conditional compilation
+#if defined(TYPE) && TYPE == SERVER
+#define TYPE_SERVER
+#elif defined(TYPE) && TYPE == CLIENT
+#define TYPE_CLIENT
+#endif
+
+// Define symbols for conditional compilation
+#if defined(WIRELESS) && WIRELESS == ESPNOW
+#define WIRELESS_ESPNOW
+#include <esp_now.h>
+#elif defined(WIRELESS) && WIRELESS == WIFI_TCP
+#define WIRELESS_TCP
+#elif defined(WIRELESS) && WIRELESS == WIFI_UDP
+#define WIRELESS_UDP
+#endif
+
+// Buffering configuration
+#define NUM_PACKETS 10 // Number of samples to buffer before sending
+
+const char *ssid = "DualAccUDP_AP";
+const char *password = "12345678";
+#define PORT 12345
+Ticker ticker;
+#define SAMPLE_FREQ 250
+
+#ifdef WIRELESS_ESPNOW
+// ESP-NOW configuration
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Broadcast address
+char packetBuffer[256]; // Buffer to accumulate packets
+int packetCount = 0; // Current number of packets in buffer
+#elif defined WIRELESS_TCP
+WiFiServer server(PORT);
+WiFiClient client;
+#elif defined WIRELESS_UDP
+WiFiUDP udp;
+#endif
+
+const char *serverIP = "192.168.4.1"; // APのIP
+char buf[1025];
+
+#ifdef TYPE_SERVER
+uint32_t t0;
+uint32_t lastReceiveTime = 0;  // Track last receive time for SERVER
+#else
+int n = 0;
+#endif
+
+volatile uint8_t fSample = 0;
+
+void IRAM_ATTR onTicker()
+{
+//	printf("fSample = %d", fSample);
+	fSample = 1;
+//	printf("-> %d\n", fSample);
+}
+
+#ifdef WIRELESS_ESPNOW
+// Callback function for when data is sent
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+	if (status != ESP_NOW_SEND_SUCCESS) {
+		printf("Last Packet Send Status = FAILED\n");
+	} else {
+		printf("Last Packet Send Status = SUCCESS\n");
+	}
+}
+
+// Callback function for when data is received
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+	uint32_t currentTime = millis();
+	uint32_t timeSinceLast = (lastReceiveTime == 0) ? 0 : (currentTime - lastReceiveTime);
+	lastReceiveTime = currentTime;
+	
+	printf("[%d ms] Received %d bytes (%.1f ms since last), from: ", 
+		   currentTime, len, (float)timeSinceLast);
+	for (int i = 0; i < 6; i++) {
+		printf("%02X", mac[i]);
+		if (i < 5) printf(":");
+	}
+	printf(": ");
+	for (int i = 0; i < len; i++) {
+		printf("%c", incomingData[i]);
+	}
+	printf("\n");
+}
+#endif
+
+void setup()
+{
+	M5.begin();
+
+#ifdef TYPE_SERVER
+#ifdef WIRELESS_ESPNOW
+	// Initialize ESP-NOW in AP mode (for receiving)
+	WiFi.mode(WIFI_MODE_AP);
+	if (esp_now_init() != ESP_OK) {
+		printf("Error initializing ESP-NOW\n");
+		return;
+	}
+	// Register receive callback
+	esp_now_register_recv_cb(onDataRecv);
+	printf("ESP-NOW initialized in AP mode (receiving)\n");
+#else
+	// アクセスポイントモードに設定
+	WiFi.softAP(ssid, password);
+	printf("WiFi AP started, IP Address: %s\n", WiFi.softAPIP().toString());
+#ifdef WIRELESS_TCP
+	server.begin();
+	printf("TCP server started on port %d\n", PORT);
+#elif defined WIRELESS_UDP
+	udp.begin(PORT);
+	printf("Listening on UDP port %d\n", PORT);
+#endif
+#endif
+	t0 = millis();
+#else // TYPE_CLIENT
+#ifdef WIRELESS_ESPNOW
+	// Initialize ESP-NOW in Station mode (for sending)
+	WiFi.mode(WIFI_MODE_STA);
+	if (esp_now_init() != ESP_OK) {
+		printf("Error initializing ESP-NOW\n");
+		return;
+	}
+	// Register send callback
+	esp_now_register_send_cb(onDataSent);
+	
+	// Add peer (broadcast)
+	esp_now_peer_info_t peerInfo = {};
+	memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+	peerInfo.channel = 0;
+	peerInfo.encrypt = false;
+	
+	if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+		printf("Failed to add peer\n");
+		return;
+	}
+	printf("ESP-NOW initialized in STA mode (sending)\n");
+	printf("Broadcast peer added\n");
+#else
+	// Connect to WiFi network
+	WiFi.begin(ssid, password);
+	printf("Connecting to WiFi...");
+	int attempts = 0;
+	while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+		delay(500);
+		printf(".");
+		attempts++;
+	}
+	if (WiFi.status() == WL_CONNECTED) {
+		printf("\nConnected to WiFi, IP Address: %s\n", WiFi.localIP().toString());
+	} else {
+		printf("\nFailed to connect to WiFi\n");
+	}
+#endif
+
+//	for (uint16_t i = 0; i < 1000; i++) buf[i] = '0' + (i % 10); buf[1000] = '\0';
+	sprintf(buf, "0.123,0.234,0.345,0.456,0.567,0.678\n");
+
+#ifdef WIRELESS_TCP
+	printf("Connecting to TCP server at %s:%d...\n", serverIP, PORT);
+	int maxAttempts = 5;
+	while (!client.connect(serverIP, PORT) && maxAttempts-- > 0) {
+		printf(".");
+		delay(1000);
+	}
+	if (client.connected()) {
+		printf("\nConnected to TCP server\n");
+	} else {
+		printf("\nFailed to connect to TCP server\n");
+	}
+#endif
+
+	packetCount = 0;
+	memset(packetBuffer, 0, sizeof(packetBuffer));
+	ticker.attach_ms((int)(1000 / SAMPLE_FREQ), onTicker);
+#endif
+}
+
+void loop()
+{
+#ifdef TYPE_SERVER
+#ifdef WIRELESS_ESPNOW
+	// ESP-NOW server receives data via callback (onDataRecv)
+	// No polling needed, data is received asynchronously
+	delay(100);
+
+#elif defined WIRELESS_TCP
+	// Accept incoming client connections
+	if (!client) {
+		client = server.available();
+		if (client) {
+			printf("[%d ms] Client connected\n", millis() - t0);
+		}
+	} 
+	
+	// Read data from connected client
+	if (client && client.available()) {
+		int len = client.available();
+		if (len > 1024) len = 1024;
+		int bytesRead = client.readBytes(buf, len);
+		buf[bytesRead] = '\0';
+		uint32_t currentTime = millis() - t0;
+		uint32_t timeSinceLast = (lastReceiveTime == 0) ? 0 : (currentTime - lastReceiveTime);
+		lastReceiveTime = currentTime;
+		printf("[%d ms] TCP received %d bytes (%.1f ms since last): %s", 
+			   currentTime, bytesRead, (float)timeSinceLast, buf);
+	}
+
+#elif defined WIRELESS_UDP
+	// Poll for incoming UDP packets
+	int packetSize = udp.parsePacket();
+	if (packetSize > 0) {
+		// Read packet
+		int len = packetSize;
+		if (len > 1024) len = 1024;
+		int bytesRead = udp.read(buf, len);
+		if (bytesRead > 0) {
+			buf[bytesRead] = '\0';
+		}
+		uint32_t currentTime = millis() - t0;
+		uint32_t timeSinceLast = (lastReceiveTime == 0) ? 0 : (currentTime - lastReceiveTime);
+		lastReceiveTime = currentTime;
+		printf("[%d ms] UDP received %d bytes (%.1f ms since last) from %s:%d: %s", 
+			   currentTime, bytesRead, (float)timeSinceLast,
+			   udp.remoteIP().toString().c_str(), udp.remotePort(), buf);
+	}
+#endif
+
+#else // TYPE_CLIENT
+	// Wait for the next sample tick
+	fSample = 0;
+	while(fSample == 0) delayMicroseconds(10);
+
+#ifdef WIRELESS_ESPNOW
+	// Send data immediately when sample is ready
+	printf("Sending: %s", buf);
+	if (esp_now_send(broadcastAddress, (uint8_t *)buf, strlen(buf) + 1) != ESP_OK) {
+		printf("Error sending data\n");
+	}
+
+#elif defined WIRELESS_TCP
+	// Send data over TCP if connected
+	if (client.connected()) {
+		client.print(buf);
+		printf("Sent via TCP: %s", buf);
+	} else {
+		printf("TCP disconnected, attempting to reconnect to %s:%d\n", serverIP, PORT);
+		if (!client.connect(serverIP, PORT)) {
+			printf("Reconnection failed\n");
+		}
+	}
+
+#elif defined WIRELESS_UDP
+	// Send data over UDP
+	printf("Sending via UDP to %s:%d: %s", serverIP, PORT, buf);
+	udp.beginPacket(serverIP, PORT);
+	udp.print(buf);
+	if (!udp.endPacket()) {
+		printf("Error sending UDP packet\n");
+	}
+#endif
+
+#endif
+}
