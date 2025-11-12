@@ -48,6 +48,11 @@
 // Buffering configuration
 #define NUM_PACKETS 10 // Number of samples to buffer before sending
 
+// Command definitions
+#define CMD_START 0x01  // Start data transmission
+#define CMD_STOP  0x02  // Stop data transmission
+#define CMD_STATUS 0x03 // Request status
+
 const char *ssid = "DualAccUDP_AP";
 const char *password = "12345678";
 #define PORT 12345
@@ -74,6 +79,7 @@ uint32_t t0;
 uint32_t lastReceiveTime = 0;  // Track last receive time for SERVER
 #else
 int n = 0;
+volatile uint8_t isTransmitting = 1;  // Flag to control transmission (CLIENT only)
 #endif
 
 volatile uint8_t fSample = 0;
@@ -98,11 +104,43 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 // Callback function for when data is received
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 	uint32_t currentTime = millis();
+	
+	// Check if it's a command (single byte)
+	if (len == 1) {
+		uint8_t cmd = incomingData[0];
+		printf("[%d ms] Command received: ", currentTime);
+		switch(cmd) {
+#ifdef TYPE_CLIENT
+			case CMD_START:
+				printf("START\n");
+				isTransmitting = 1;
+				break;
+			case CMD_STOP:
+				printf("STOP\n");
+				isTransmitting = 0;
+				break;
+			case CMD_STATUS:
+				printf("STATUS\n");
+				break;
+#endif
+			default:
+				printf("UNKNOWN (0x%02X)\n", cmd);
+				break;
+		}
+		return;
+	}
+	
+	// Handle data reception
+#ifdef TYPE_SERVER
 	uint32_t timeSinceLast = (lastReceiveTime == 0) ? 0 : (currentTime - lastReceiveTime);
 	lastReceiveTime = currentTime;
 	
 	printf("[%d ms] Received %d bytes (%.1f ms since last), from: ", 
 		   currentTime, len, (float)timeSinceLast);
+#else
+	printf("[%d ms] Received %d bytes from: ", currentTime, len);
+#endif
+	
 	for (int i = 0; i < 6; i++) {
 		printf("%02X", mac[i]);
 		if (i < 5) printf(":");
@@ -118,6 +156,11 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 void setup()
 {
 	M5.begin();
+
+#ifdef TYPE_SERVER
+	// Initialize button for sending commands
+	printf("SERVER: Press button to toggle CLIENT transmission\n");
+#endif
 
 #ifdef TYPE_SERVER
 #ifdef WIRELESS_ESPNOW
@@ -209,6 +252,41 @@ void setup()
 void loop()
 {
 #ifdef TYPE_SERVER
+#ifdef TYPE_SERVER
+
+	// Check for button press to send commands
+	M5.update();
+	static uint8_t lastButtonState = 0;
+	static uint32_t lastButtonTime = 0;
+	
+	if (M5.BtnA.wasPressed()) {
+		// Prevent bouncing
+		if (millis() - lastButtonTime > 500) {
+			lastButtonState = !lastButtonState;
+			uint8_t cmd = lastButtonState ? CMD_START : CMD_STOP;
+			printf("[%d ms] Sending command: %s\n", millis() - t0, 
+			       lastButtonState ? "START" : "STOP");
+			
+#ifdef WIRELESS_ESPNOW
+			// Send command via ESP-NOW
+			if (esp_now_send(broadcastAddress, &cmd, 1) != ESP_OK) {
+				printf("Error sending command\n");
+			}
+#elif defined WIRELESS_TCP
+			// Send command via TCP
+			if (client && client.connected()) {
+				client.write(&cmd, 1);
+			}
+#elif defined WIRELESS_UDP
+			// Send command via UDP
+			udp.beginPacket(clientIP, clientPort);
+			udp.write(&cmd, 1);
+			udp.endPacket();
+#endif
+			lastButtonTime = millis();
+		}
+	}
+
 #ifdef WIRELESS_ESPNOW
 	// ESP-NOW server receives data via callback (onDataRecv)
 	// No polling needed, data is received asynchronously
@@ -257,6 +335,19 @@ void loop()
 #endif
 
 #else // TYPE_CLIENT
+	// Check for button press (M5 buttonA to toggle transmission)
+	M5.update();
+	if (M5.BtnA.wasPressed()) {
+		isTransmitting = !isTransmitting;
+		printf("CLIENT: Transmission %s\n", isTransmitting ? "STARTED" : "STOPPED");
+	}
+
+	// Skip sending if not transmitting
+	if (!isTransmitting) {
+		delay(10);
+		return;
+	}
+
 	// Wait for the next sample tick
 	fSample = 0;
 	while(fSample == 0) delayMicroseconds(10);
@@ -290,5 +381,6 @@ void loop()
 	}
 #endif
 
-#endif
+#endif // TYPE_CLIENT
+#endif // TYPE_SERVER
 }
