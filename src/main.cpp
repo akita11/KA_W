@@ -5,6 +5,8 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Ticker.h>
+// FastLED for AtomS3 Lite onboard LED
+#include <FastLED.h>
 
 // Device type constants
 #define SERVER 1
@@ -77,10 +79,45 @@ char buf[1025];
 #ifdef TYPE_SERVER
 uint32_t t0;
 uint32_t lastReceiveTime = 0;  // Track last receive time for SERVER
+// Throughput measurement (server)
+uint32_t server_recv_window_start = 0;
+uint32_t server_recv_window_bytes = 0;
+#define SERVER_THROUGHPUT_WINDOW_MS 1000
 #else
 int n = 0;
 volatile uint8_t isTransmitting = 1;  // Flag to control transmission (CLIENT only)
 #endif
+
+// LED state tracking: true = transmitting(blue), false = stopped(green)
+volatile uint8_t ledTransmittingState = 0;
+// Track last sent command for reporting in send callback
+volatile uint8_t lastCommandSent = 0;
+
+// FastLED fallback
+#define FALLBACK_NUM_LEDS 1
+static CRGB fastled_leds[FALLBACK_NUM_LEDS];
+static bool fastled_initialized = false;
+static int fastled_pin = -1;
+
+static void initFastLEDFallback() {
+	if (fastled_initialized) return;
+	// Use ATOMS3 Lite LED pin 35
+	fastled_pin = 35;
+	FastLED.addLeds<WS2812B, 35, GRB>(fastled_leds, FALLBACK_NUM_LEDS);
+	FastLED.setBrightness(64);
+	fastled_initialized = true;
+	fastled_leds[0] = CRGB::Green;
+	FastLED.show();
+}
+
+// Helper: update LED according to transmission state
+static void updateTransmissionLED(bool transmitting) {
+	if (fastled_initialized) {
+		if (transmitting) fastled_leds[0] = CRGB::Blue;
+		else fastled_leds[0] = CRGB::Green;
+		FastLED.show();
+	}
+}
 
 volatile uint8_t fSample = 0;
 
@@ -95,9 +132,17 @@ void IRAM_ATTR onTicker()
 // Callback function for when data is sent
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 	if (status != ESP_NOW_SEND_SUCCESS) {
-		printf("Last Packet Send Status = FAILED\n");
+		printf("Last Packet Send Status = FAILED");
 	} else {
-		printf("Last Packet Send Status = SUCCESS\n");
+		printf("Last Packet Send Status = SUCCESS");
+	}
+	// Report which command this send corresponds to (if any)
+	if (lastCommandSent == CMD_START) {
+		printf(" (command: START)\n");
+	} else if (lastCommandSent == CMD_STOP) {
+		printf(" (command: STOP)\n");
+	} else {
+		printf("\n");
 	}
 }
 
@@ -105,19 +150,32 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 	uint32_t currentTime = millis();
 	
+#if defined(TYPE_CLIENT) || defined(TYPE_SERVER)
 	// Check if it's a command (single byte)
 	if (len == 1) {
 		uint8_t cmd = incomingData[0];
-		printf("[%d ms] Command received: ", currentTime);
+		// Print sender MAC (ESP-NOW) then the command
+		printf("[%d ms] Command received from ", currentTime);
+		for (int i = 0; i < 6; i++) {
+			printf("%02X", mac[i]);
+			if (i < 5) printf(":");
+		}
+		printf(": ");
 		switch(cmd) {
 #ifdef TYPE_CLIENT
 			case CMD_START:
 				printf("START\n");
 				isTransmitting = 1;
+				// Update LED: transmitting
+				ledTransmittingState = 1;
+				updateTransmissionLED(true);
 				break;
 			case CMD_STOP:
 				printf("STOP\n");
 				isTransmitting = 0;
+				// Update LED: stopped
+				ledTransmittingState = 0;
+				updateTransmissionLED(false);
 				break;
 			case CMD_STATUS:
 				printf("STATUS\n");
@@ -129,6 +187,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 		}
 		return;
 	}
+#endif
 	
 	// Handle data reception
 #ifdef TYPE_SERVER
@@ -150,6 +209,20 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 		printf("%c", incomingData[i]);
 	}
 	printf("\n");
+
+#ifdef TYPE_SERVER
+	// Update throughput window
+	server_recv_window_bytes += len;
+	if (server_recv_window_start == 0) server_recv_window_start = currentTime;
+	uint32_t elapsed = currentTime - server_recv_window_start;
+	if (elapsed >= SERVER_THROUGHPUT_WINDOW_MS) {
+		float bps = (server_recv_window_bytes * 1000.0f) / (float)elapsed;
+		printf("[%d ms] Throughput: %.1f B/s (%.2f KB/s)\n", currentTime, bps, bps / 1024.0f);
+		// reset window
+		server_recv_window_bytes = 0;
+		server_recv_window_start = currentTime;
+	}
+#endif
 }
 #endif
 
@@ -157,21 +230,30 @@ void setup()
 {
 	M5.begin();
 
+	// Initialize button notice for server
 #ifdef TYPE_SERVER
-	// Initialize button for sending commands
 	printf("SERVER: Press button to toggle CLIENT transmission\n");
 #endif
+
+	// Initialize FastLED fallback unconditionally (do not use M5.Led)
+	initFastLEDFallback();
+	// ensure initial color is green (stopped)
+	fastled_leds[0] = CRGB(0, 30, 0);
+	FastLED.show();
 
 #ifdef TYPE_SERVER
 #ifdef WIRELESS_ESPNOW
 	// Initialize ESP-NOW in AP mode (for receiving)
-	WiFi.mode(WIFI_MODE_AP);
+	// Use AP+STA mode so ESP-NOW can use the WiFi interface for sending and receiving
+	WiFi.mode(WIFI_MODE_APSTA);
 	if (esp_now_init() != ESP_OK) {
 		printf("Error initializing ESP-NOW\n");
 		return;
 	}
 	// Register receive callback
 	esp_now_register_recv_cb(onDataRecv);
+	// Register send callback so we can observe send results on server as well
+	esp_now_register_send_cb(onDataSent);
 	printf("ESP-NOW initialized in AP mode (receiving)\n");
 #else
 	// アクセスポイントモードに設定
@@ -246,6 +328,9 @@ void setup()
 	packetCount = 0;
 	memset(packetBuffer, 0, sizeof(packetBuffer));
 	ticker.attach_ms((int)(1000 / SAMPLE_FREQ), onTicker);
+	// Set initial LED state on client according to isTransmitting
+	ledTransmittingState = isTransmitting;
+	updateTransmissionLED(isTransmitting);
 #endif
 }
 
@@ -269,23 +354,38 @@ void loop()
 			
 #ifdef WIRELESS_ESPNOW
 			// Send command via ESP-NOW
-			if (esp_now_send(broadcastAddress, &cmd, 1) != ESP_OK) {
-				printf("Error sending command\n");
+			lastCommandSent = cmd;
+			// Ensure peer exists for broadcast (some ESP-NOW setups require adding peer)
+			if (!esp_now_is_peer_exist(broadcastAddress)) {
+				esp_now_peer_info_t peer = {};
+				memcpy(peer.peer_addr, broadcastAddress, 6);
+				peer.channel = 0;
+				peer.encrypt = false;
+				esp_err_t addres = esp_now_add_peer(&peer);
+				printf("esp_now_add_peer returned %d (%s)\n", addres, esp_err_to_name(addres));
 			}
+			esp_err_t espres = esp_now_send(broadcastAddress, &cmd, 1);
+			printf("esp_now_send returned %d (%s)\n", espres, esp_err_to_name(espres));
 #elif defined WIRELESS_TCP
 			// Send command via TCP
 			if (client && client.connected()) {
-				client.write(&cmd, 1);
+				int written = client.write(&cmd, 1);
+				printf("TCP: wrote %d bytes for command %s\n", written, lastButtonState ? "START" : "STOP");
 			}
 #elif defined WIRELESS_UDP
 			// Send command via UDP
 			udp.beginPacket(clientIP, clientPort);
 			udp.write(&cmd, 1);
-			udp.endPacket();
+			int udpRes = udp.endPacket();
+			printf("UDP: endPacket returned %d for command %s\n", udpRes, lastButtonState ? "START" : "STOP");
 #endif
 			lastButtonTime = millis();
 		}
 	}
+
+	// Update server LED to reflect requested client state
+	ledTransmittingState = lastButtonState;
+	updateTransmissionLED(ledTransmittingState);
 
 #ifdef WIRELESS_ESPNOW
 	// ESP-NOW server receives data via callback (onDataRecv)
@@ -340,6 +440,9 @@ void loop()
 	if (M5.BtnA.wasPressed()) {
 		isTransmitting = !isTransmitting;
 		printf("CLIENT: Transmission %s\n", isTransmitting ? "STARTED" : "STOPPED");
+		// Update LED to reflect client transmission state
+		ledTransmittingState = isTransmitting;
+		updateTransmissionLED(isTransmitting);
 	}
 
 	// Skip sending if not transmitting
