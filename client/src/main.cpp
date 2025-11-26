@@ -9,6 +9,9 @@
 #define WIFI_UDP 2
 #define WIFI_TCP 3
 
+
+#define CLIENT_ID 1 // 1または2に設定（2台目は2に変更）
+#define NUM_CLIENTS 2
 #define WIRELESS ESPNOW
 // #define WIRELESS UDP
 
@@ -213,59 +216,53 @@ uint32_t lastReceiveTime, currentTime;
 
 void loop()
 {
-	/*
-	M5.update();
-	if (M5.BtnA.wasPressed())
-	{
-		isTransmitting = !isTransmitting;
-		printf("CLIENT: Transmission %s\n", isTransmitting ? "STARTED" : "STOPPED");
-		updateTransmissionLED(isTransmitting);
-	}
-	if (!isTransmitting)
-	{
-		delay(10);
-		return;
-	}
-	*/
 	fSample = 0;
 	while (fSample == 0)
 		delayMicroseconds(10);
+
 	if (isTransmitting == 1)
 	{
-		sprintf(buf, "%d,0.123,0.234,0.345,0.456,0.567,0.678\n", n);
-		strcat(buf_packet, buf);
-		n++;
-		if (n == DATA_PER_PACKET)
+		// 時分割スロット判定
+		// 例: 2台なら 0,1,0,1... の交互スロット
+		uint32_t slot_period_ms = 1000 / (SAMPLE_FREQ / NUM_CLIENTS); // 例: 250Hz/2=125Hz→8ms
+		uint32_t now = millis();
+		int slot = ((now / slot_period_ms) % NUM_CLIENTS) + 1; // 1 or 2
+		if (slot == CLIENT_ID)
 		{
-			n = 0;
-			currentTime = millis();
-			uint32_t timeSinceLast = (lastReceiveTime == 0) ? 0 : (currentTime - lastReceiveTime);
-			lastReceiveTime = currentTime;
-			printf("%d ms\n", timeSinceLast);
+			sprintf(buf, "%d,0.123,0.234,0.345,0.456,0.567,0.678\n", n);
+			strcat(buf_packet, buf);
+			n++;
+			if (n == DATA_PER_PACKET)
+			{
+				n = 0;
+				currentTime = millis();
+				uint32_t timeSinceLast = (lastReceiveTime == 0) ? 0 : (currentTime - lastReceiveTime);
+				lastReceiveTime = currentTime;
 #ifdef WIRELESS_ESPNOW
-			printf("Sending: %d bytes\n", strlen(buf_packet));
-			if (esp_now_send(broadcastAddress, (uint8_t *)buf_packet, strlen(buf_packet) + 1) != ESP_OK)
-				printf("Error sending data\n");
+				printf("[CLIENT %d] Sending: %d bytes in %d ms\n", CLIENT_ID, (int)strlen(buf_packet), timeSinceLast);
+				if (esp_now_send(broadcastAddress, (uint8_t *)buf_packet, strlen(buf_packet) + 1) != ESP_OK)
+					printf("Error sending data\n");
 #elif defined(WIRELESS_TCP)
-			if (client.connected())
-			{
-				client.print(buf);
-				printf("Sent via TCP: %s", buf);
-			}
-			else
-			{
-				printf("TCP disconnected...reconnect\n");
-				if (!client.connect(serverIP, PORT))
-					printf("Reconnection failed\n");
-			}
+				if (client.connected())
+				{
+					client.print(buf);
+					printf("Sent via TCP: %s", buf);
+				}
+				else
+				{
+					printf("TCP disconnected...reconnect\n");
+					if (!client.connect(serverIP, PORT))
+						printf("Reconnection failed\n");
+				}
 #elif defined(WIRELESS_UDP)
-			printf("Sending via UDP to %s:%d: %s", serverIP, PORT, buf);
-			udp.beginPacket(serverIP, PORT);
-			udp.print(buf);
-			if (!udp.endPacket())
-				printf("Error sending UDP packet\n");
+				printf("Sending via UDP to %s:%d: %s", serverIP, PORT, buf);
+				udp.beginPacket(serverIP, PORT);
+				udp.print(buf);
+				if (!udp.endPacket())
+					printf("Error sending UDP packet\n");
 #endif
+			}
+			strcpy(buf_packet, "");
 		}
-		strcpy(buf_packet, "");
 	}
 }

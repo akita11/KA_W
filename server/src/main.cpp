@@ -123,10 +123,7 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 	{
 		printf("Last Packet Send Status = FAILED");
 	}
-	else
-	{
-		printf("Last Packet Send Status = SUCCESS");
-	}
+//	else printf("Last Packet Send Status = SUCCESS");
 	// Report which command this send corresponds to (if any)
 	if (lastCommandSent == CMD_START)
 	{
@@ -255,10 +252,10 @@ void loop()
 			peer.channel = 0;
 			peer.encrypt = false;
 			esp_err_t addres = esp_now_add_peer(&peer);
-			printf("esp_now_add_peer returned %d (%s)\n", addres, esp_err_to_name(addres));
+//			printf("esp_now_add_peer returned %d (%s)\n", addres, esp_err_to_name(addres));
 		}
 		esp_err_t espres = esp_now_send(broadcastAddress, &cmd, 1);
-		printf("esp_now_send returned %d (%s)\n", espres, esp_err_to_name(espres));
+//		printf("esp_now_send returned %d (%s)\n", espres, esp_err_to_name(espres));
 #elif defined WIRELESS_TCP
 			// Send command via TCP
 			if (client && client.connected())
