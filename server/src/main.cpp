@@ -31,19 +31,121 @@
 #define WIRELESS_UDP
 #endif
 
-// Buffering configuration
-#define NUM_PACKETS 10 // Number of samples to buffer before sending
-
 // Command definitions
-#define CMD_START 0x01	// Start data transmission
-#define CMD_STOP 0x02		// Stop data transmission
-#define CMD_STATUS 0x03 // Request status
+#define CMD_START 0x01
+#define CMD_STOP 0x02
+#define CMD_STATUS 0x03
 
-const char *ssid = "DualAccUDP_AP";
-const char *password = "12345678";
+// Received data queue and task
+typedef struct {
+	uint8_t mac[6];
+	uint8_t data[256];
+	int len;
+} RecvItem;
+
+static QueueHandle_t recvQueue = NULL;
+
+// Forward declarations for variables used in recvTask
+extern uint32_t lastReceiveTime;
+extern uint32_t previousThroughputSamplingTime;
+extern uint16_t nThroughputSamples;
+#define SERVER_THROUGHPUT_SAMPLE 100
+
+// Callback function for when data is received - enqueue and return quickly
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
+{
+	if (recvQueue == NULL) return;
+	RecvItem item;
+	memcpy(item.mac, mac, 6);
+	int copyLen = len;
+	if (copyLen > (int)sizeof(item.data)) copyLen = sizeof(item.data);
+	memcpy(item.data, incomingData, copyLen);
+	item.len = copyLen;
+
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	// try FromISR first (fast and safe if called in ISR-like context)
+	BaseType_t ok = xQueueSendFromISR(recvQueue, &item, &xHigherPriorityTaskWoken);
+	if (ok != pdTRUE) {
+		// fallback to non-ISR enqueue (non-blocking)
+		ok = xQueueSend(recvQueue, &item, 0);
+	}
+	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
+}
+
+// Task to process received items
+void recvTask(void *pvParameters) {
+	RecvItem item;
+	for (;;) {
+		if (xQueueReceive(recvQueue, &item, portMAX_DELAY) == pdTRUE) {
+			uint32_t currentTime = millis();
+			if (item.len == 1) {
+				uint8_t cmd = item.data[0];
+				printf("[%d ms] Command received from ", currentTime);
+				for (int i = 0; i < 6; i++) {
+					printf("%02X", item.mac[i]);
+					if (i < 5) printf(":");
+				}
+				printf(": ");
+				switch (cmd) {
+				default:
+					printf("UNKNOWN (0x%02X)\n", cmd);
+					break;
+				}
+				continue;
+			}
+			// データ受信時に内容とmillis()を表示
+			//printf("[SERVER] Data received at %lu ms: %d bytes\n", (unsigned long)currentTime, item.len);
+			//for (int i = 0; i < item.len; i++) {
+			//	char c = item.data[i];
+			//	if (c >= 32 && c <= 126) putchar(c); else putchar('.');
+			//}
+			//putchar('\n');
+			// ...既存のスループット計算はそのまま...
+			lastReceiveTime = currentTime;
+			nThroughputSamples++;
+			if (nThroughputSamples == SERVER_THROUGHPUT_SAMPLE) {
+				uint32_t timeSinceLast = (previousThroughputSamplingTime == 0) ? 0 : (currentTime - previousThroughputSamplingTime);
+				float avgTime = (float)timeSinceLast / (float)SERVER_THROUGHPUT_SAMPLE;
+				nThroughputSamples = 0;
+				printf("Average interval: %.2f ms / %d - %d\n", avgTime, currentTime, previousThroughputSamplingTime);
+				previousThroughputSamplingTime = currentTime;
+			}
+		}
+	}
+}
+
 #define PORT 12345
 Ticker ticker;
 #define SAMPLE_FREQ 250
+// TDMA parameters
+#define TDMA_FRAME_MS 24 // Frame period in milliseconds
+#define TDMA_BEACON0 0    // beacon payload first byte marker
+#define TDMA_BEACON1 1    // beacon payload second byte marker
+Ticker beaconTicker;
+
+// Communication task and queue
+typedef struct {
+	uint8_t addr[6];
+	uint8_t data[32];
+	size_t len;
+} SendItem;
+
+static QueueHandle_t sendQueue = NULL;
+static TaskHandle_t commTaskHandle = NULL;
+
+void commTask(void *pvParameters) {
+	SendItem item;
+	vTaskDelay(pdMS_TO_TICKS(500)); // Wait for WiFi/ESP-NOW to fully initialize
+	for(;;) {
+		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE) {
+			vTaskDelay(pdMS_TO_TICKS(2)); // Small delay before send
+			esp_err_t res = esp_now_send(item.addr, item.data, item.len);
+			if (res != ESP_OK) {
+				printf("commTask: esp_now_send failed %d\n", res);
+			}
+		}
+	}
+}
 
 #ifdef WIRELESS_ESPNOW
 // ESP-NOW configuration
@@ -63,11 +165,9 @@ char buf[1025];
 uint32_t t0;
 uint32_t lastReceiveTime = 0; // Track last receive time for SERVER
 // Throughput measurement (server)
-
-
 #define SERVER_THROUGHPUT_SAMPLE 100
-uint32_t sumTime = 0;
 uint16_t nThroughputSamples = 0;
+uint32_t previousThroughputSamplingTime = 0;
 
 // LED state tracking: true = transmitting(blue), false = stopped(green)
 volatile uint8_t ledTransmittingState = 0;
@@ -128,66 +228,19 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 	if (lastCommandSent == CMD_START)
 	{
 		printf(" (command: START)\n");
+		lastCommandSent = 0; // Clear after reporting to avoid duplicate reports
 	}
 	else if (lastCommandSent == CMD_STOP)
 	{
 		printf(" (command: STOP)\n");
+		lastCommandSent = 0; // Clear after reporting to avoid duplicate reports
 	}
 	else
 	{
-		printf("\n");
+		// Silent for beacon and other data packets
 	}
 }
 
-// Callback function for when data is received
-void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-	uint32_t currentTime = millis();
-
-	// Check if it's a command (single byte)
-	if (len == 1)
-	{
-		uint8_t cmd = incomingData[0];
-		// Print sender MAC (ESP-NOW) then the command
-		printf("[%d ms] Command received from ", currentTime);
-		for (int i = 0; i < 6; i++)
-		{
-			printf("%02X", mac[i]);
-			if (i < 5)
-				printf(":");
-		}
-		printf(": ");
-		switch (cmd)
-		{
-		default:
-			printf("UNKNOWN (0x%02X)\n", cmd);
-			break;
-		}
-		return;
-	}
-
-	// Handle data reception
-	uint32_t timeSinceLast = (lastReceiveTime == 0) ? 0 : (currentTime - lastReceiveTime);
-	lastReceiveTime = currentTime;
-
-	sumTime += timeSinceLast;
-	nThroughputSamples++;
-//	printf("[%d ms] Received %d bytes (%d ms since last), from: ", currentTime, len, timeSinceLast);
-	if (nThroughputSamples == SERVER_THROUGHPUT_SAMPLE){
-		nThroughputSamples = 0;
-		float avgTime = (float)sumTime / (float)SERVER_THROUGHPUT_SAMPLE;
-		printf("Average interval: %.2f ms\n", avgTime);
-		sumTime = 0;
-	}
-/*
-	for (int i = 0; i < 6; i++) printf("%02X", mac[i]);
-	printf("\n");
-*/
-/*
-	for (int i = 0; i < len; i++) printf("%c", incomingData[i]);
-	printf("\n");
-*/
-}
 #endif
 
 void setup()
@@ -201,9 +254,9 @@ void setup()
 	FastLED.show();
 
 #ifdef WIRELESS_ESPNOW
-	// Initialize ESP-NOW in AP mode (for receiving)
-	// Use AP+STA mode so ESP-NOW can use the WiFi interface for sending and receiving
-	WiFi.mode(WIFI_MODE_APSTA);
+	// Initialize ESP-NOW in STA mode (simpler, avoids AP overhead)
+	WiFi.mode(WIFI_MODE_STA);
+	vTaskDelay(pdMS_TO_TICKS(100));
 	if (esp_now_init() != ESP_OK)
 	{
 		printf("Error initializing ESP-NOW\n");
@@ -213,7 +266,41 @@ void setup()
 	esp_now_register_recv_cb(onDataRecv);
 	// Register send callback so we can observe send results on server as well
 	esp_now_register_send_cb(onDataSent);
-	printf("ESP-NOW initialized in AP mode (receiving)\n");
+	// Register broadcast peer explicitly before starting beacon
+	if (!esp_now_is_peer_exist(broadcastAddress)) {
+		esp_now_peer_info_t peer = {};
+		memcpy(peer.peer_addr, broadcastAddress, 6);
+		peer.channel = 0;
+		peer.encrypt = false;
+		esp_now_add_peer(&peer);
+	}
+	printf("ESP-NOW initialized in STA mode (receiving)\n");
+	vTaskDelay(pdMS_TO_TICKS(100)); // Small delay after ESP-NOW init
+	// create send queue and communication task (pinned to core 0)
+	sendQueue = xQueueCreate(10, sizeof(SendItem));
+	if (sendQueue == NULL) {
+		printf("Failed to create sendQueue\n");
+	} else {
+		xTaskCreatePinnedToCore(commTask, "CommTask", 4096, NULL, configMAX_PRIORITIES-2, &commTaskHandle, 0);
+	}
+	// create receive queue and task
+	recvQueue = xQueueCreate(16, sizeof(RecvItem));
+	if (recvQueue == NULL) {
+		printf("Failed to create recvQueue\n");
+	} else {
+		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 0);
+	}
+	// Start periodic beacon for TDMA (broadcast) - enqueue beacon to sendQueue from ISR
+	beaconTicker.attach_ms(TDMA_FRAME_MS, [](){
+		if (sendQueue == NULL) return;
+		SendItem item;
+		memcpy(item.addr, broadcastAddress, 6);
+		item.data[0] = 0xBE; item.data[1] = 0xAC; item.len = 2;
+		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+		xQueueSendFromISR(sendQueue, &item, &xHigherPriorityTaskWoken);
+		if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
+		//printf("[SERVER] Beacon sent at %lu ms\n", millis()); // debug: comment out for now
+	});
 #else
 	// アクセスポイントモードに設定
 	WiFi.softAP(ssid, password);
@@ -254,8 +341,19 @@ void loop()
 			esp_err_t addres = esp_now_add_peer(&peer);
 //			printf("esp_now_add_peer returned %d (%s)\n", addres, esp_err_to_name(addres));
 		}
-		esp_err_t espres = esp_now_send(broadcastAddress, &cmd, 1);
-//		printf("esp_now_send returned %d (%s)\n", espres, esp_err_to_name(espres));
+		// enqueue command to sendQueue for commTask
+		if (sendQueue != NULL) {
+			SendItem item;
+			memcpy(item.addr, broadcastAddress, 6);
+			item.data[0] = cmd;
+			item.len = 1;
+			if (xQueueSend(sendQueue, &item, pdMS_TO_TICKS(10)) != pdTRUE) {
+				printf("sendQueue full - failed to enqueue cmd\n");
+			}
+		} else {
+			// fallback: direct send
+			esp_err_t espres = esp_now_send(broadcastAddress, &cmd, 1);
+		}
 #elif defined WIRELESS_TCP
 			// Send command via TCP
 			if (client && client.connected())

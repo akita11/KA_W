@@ -23,6 +23,112 @@ Ticker ticker;
 #define SAMPLE_FREQ 250
 #define FALLBACK_NUM_LEDS 1
 
+// TDMA parameters (must match server)
+#define TDMA_FRAME_MS 24
+#define TDMA_SLOT_MS (TDMA_FRAME_MS / NUM_CLIENTS)
+// Slot guard window (ms) used to decide whether to send in slot
+#define TDMA_SLOT_WINDOW_MS (TDMA_SLOT_MS - 4)
+
+volatile uint32_t last_beacon_ms = 0; // updated when beacon received
+volatile uint32_t last_beacon_seq = 0; // ビーコンごとにインクリメント
+volatile uint32_t last_sent_beacon_seq = 0; // 送信したビーコンのシーケンス
+// Communication task and queue for client
+typedef struct {
+	uint8_t addr[6];
+	uint8_t data[256];
+	size_t len;
+} SendItem;
+
+static QueueHandle_t sendQueue = NULL;
+static TaskHandle_t commTaskHandle = NULL;
+
+// Received data queue and task
+typedef struct {
+	uint8_t mac[6];
+	uint8_t data[256];
+	int len;
+} RecvItem;
+
+static QueueHandle_t recvQueue = NULL;
+
+#if defined(WIRELESS) && WIRELESS == ESPNOW
+#include <esp_now.h>
+#endif
+
+// Forward declarations for symbols used in recvTask/commTask
+extern volatile uint8_t isTransmitting;
+extern volatile uint8_t ledTransmittingState;
+static void updateTransmissionLED(bool transmitting);
+
+// Task to process received items (client)
+void recvTask(void *pvParameters) {
+	RecvItem item;
+	for(;;) {
+		if (xQueueReceive(recvQueue, &item, portMAX_DELAY) == pdTRUE) {
+			uint32_t currentTime = millis();
+			// Beacon detection: 2-byte beacon {0xBE,0xAC}
+			if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
+				last_beacon_ms = currentTime;
+				last_beacon_seq++;
+				//printf("[CLIENT %d] Beacon received at %lu ms\n", CLIENT_ID, (unsigned long)currentTime);
+				continue;
+			}
+			if (item.len == 1) {
+				uint8_t cmd = item.data[0];
+				printf("[%d ms] Command received from ", currentTime);
+				for (int i = 0; i < 6; i++) {
+					printf("%02X", item.mac[i]);
+					if (i < 5) printf(":");
+				}
+				printf(": ");
+				switch (cmd) {
+				case CMD_START:
+					printf("START\n");
+					isTransmitting = 1;
+					ledTransmittingState = 1;
+					updateTransmissionLED(true);
+					break;
+				case CMD_STOP:
+					printf("STOP\n");
+					isTransmitting = 0;
+					ledTransmittingState = 0;
+					updateTransmissionLED(false);
+					break;
+				case CMD_STATUS:
+					printf("STATUS\n");
+					break;
+				default:
+					printf("UNKNOWN (0x%02X)\n", cmd);
+					break;
+				}
+				continue;
+			}
+			// Generic data print
+			printf("[%d ms] Received %d bytes from: ", currentTime, item.len);
+			for (int i = 0; i < 6; i++) {
+				printf("%02X", item.mac[i]);
+				if (i < 5) printf(":");
+			}
+			printf(": ");
+			for (int i = 0; i < item.len; i++) printf("%c", item.data[i]);
+			printf("\n");
+		}
+	}
+}
+
+void commTask(void *pvParameters) {
+	SendItem item;
+	for(;;) {
+		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE) {
+			esp_err_t res = esp_now_send(item.addr, item.data, item.len);
+			if (res != ESP_OK) {
+				printf("client commTask: esp_now_send failed %d\n", res);
+			}
+			vTaskDelay(pdMS_TO_TICKS(1));
+		}
+	}
+}
+
 #if defined(WIRELESS) && WIRELESS == ESPNOW
 #define WIRELESS_ESPNOW
 #include <esp_now.h>
@@ -97,52 +203,21 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
 {
-	uint32_t currentTime = millis();
-	if (len == 1)
-	{
-		uint8_t cmd = incomingData[0];
-		printf("[%d ms] Command received from ", currentTime);
-		for (int i = 0; i < 6; i++)
-		{
-			printf("%02X", mac[i]);
-			if (i < 5)
-				printf(":");
-		}
-		printf(": ");
-		switch (cmd)
-		{
-		case CMD_START:
-			printf("START\n");
-			isTransmitting = 1;
-			ledTransmittingState = 1;
-			updateTransmissionLED(true);
-			break;
-		case CMD_STOP:
-			printf("STOP\n");
-			isTransmitting = 0;
-			ledTransmittingState = 0;
-			updateTransmissionLED(false);
-			break;
-		case CMD_STATUS:
-			printf("STATUS\n");
-			break;
-		default:
-			printf("UNKNOWN (0x%02X)\n", cmd);
-			break;
-		}
-		return;
+	// enqueue received data to recvQueue for processing in recvTask
+	if (recvQueue == NULL) return;
+	RecvItem item;
+	memcpy(item.mac, mac, 6);
+	int copyLen = len;
+	if (copyLen > (int)sizeof(item.data)) copyLen = sizeof(item.data);
+	memcpy(item.data, incomingData, copyLen);
+	item.len = copyLen;
+
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	BaseType_t ok = xQueueSendFromISR(recvQueue, &item, &xHigherPriorityTaskWoken);
+	if (ok != pdTRUE) {
+		ok = xQueueSend(recvQueue, &item, 0);
 	}
-	printf("[%d ms] Received %d bytes from: ", currentTime, len);
-	for (int i = 0; i < 6; i++)
-	{
-		printf("%02X", mac[i]);
-		if (i < 5)
-			printf(":");
-	}
-	printf(": ");
-	for (int i = 0; i < len; i++)
-		printf("%c", incomingData[i]);
-	printf("\n");
+	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
 }
 #endif
 
@@ -172,6 +247,20 @@ void setup()
 		return;
 	}
 	printf("ESP-NOW initialized in STA mode (sending)\nBroadcast peer added\n");
+	// create send queue and communication task (pinned to core 0)
+	sendQueue = xQueueCreate(8, sizeof(SendItem));
+	if (sendQueue == NULL) {
+		printf("client: Failed to create sendQueue\n");
+	} else {
+		xTaskCreatePinnedToCore(commTask, "CommTask", 4096, NULL, configMAX_PRIORITIES-2, &commTaskHandle, 0);
+	}
+	// create receive queue and task
+	recvQueue = xQueueCreate(16, sizeof(RecvItem));
+	if (recvQueue == NULL) {
+		printf("client: Failed to create recvQueue\n");
+	} else {
+		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 0);
+	}
 #else
 	WiFi.begin(ssid, password);
 	printf("Connecting to WiFi...");
@@ -209,10 +298,15 @@ void setup()
 }
 
 uint16_t n = 0;
-#define DATA_PER_PACKET 3
+#define DATA_PER_PACKET 6
 // memo: ESPNOWは256バイトまで?
 
 uint32_t lastReceiveTime, currentTime;
+
+
+// 4msごとにダミーデータをバッファし、TDMAスロット進入時に最新から6個分まとめて送信
+char sample_buf[6][64];
+uint8_t sample_count = 0;
 
 void loop()
 {
@@ -220,49 +314,55 @@ void loop()
 	while (fSample == 0)
 		delayMicroseconds(10);
 
-	if (isTransmitting == 1)
-	{
-		// 時分割スロット判定
-		// 例: 2台なら 0,1,0,1... の交互スロット
-		uint32_t slot_period_ms = 1000 / (SAMPLE_FREQ / NUM_CLIENTS); // 例: 250Hz/2=125Hz→8ms
+	// 1未満・小数点以下3桁の実数6個をコンマ区切りで生成
+	float v[6];
+	for (int i = 0; i < 6; i++) {
+		v[i] = ((float)(rand() % 1000)) / 1000.0f; // 0.000～0.999
+	}
+	sample_count = (sample_count + 1) % 6;
+	sprintf(sample_buf[sample_count], "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f", v[0], v[1], v[2], v[3], v[4], v[5]);
+
+	if (isTransmitting == 1) {
 		uint32_t now = millis();
-		int slot = ((now / slot_period_ms) % NUM_CLIENTS) + 1; // 1 or 2
-		if (slot == CLIENT_ID)
-		{
-			sprintf(buf, "%d,0.123,0.234,0.345,0.456,0.567,0.678\n", n);
-			strcat(buf_packet, buf);
-			n++;
-			if (n == DATA_PER_PACKET)
-			{
-				n = 0;
-				currentTime = millis();
-				uint32_t timeSinceLast = (lastReceiveTime == 0) ? 0 : (currentTime - lastReceiveTime);
-				lastReceiveTime = currentTime;
+		if (last_beacon_ms == 0) return;
+		uint32_t offset = (now - last_beacon_ms) % TDMA_FRAME_MS;
+		uint32_t my_slot_start = (CLIENT_ID - 1) * TDMA_SLOT_MS;
+		if (offset >= my_slot_start && offset < my_slot_start + TDMA_SLOT_WINDOW_MS) {
+			if (last_sent_beacon_seq != last_beacon_seq) {
+				//printf("[CLIENT %d] Enter TDMA slot at %lu ms (offset=%lu, slot_start=%lu)\n", CLIENT_ID, (unsigned long)now, (unsigned long)offset, (unsigned long)my_slot_start);
+				// 最新データから遡って6個分まとめて送信
+				char sendbuf[400] = "";
+				for (int i = 0; i < 6; i++) {
+					int idx = (sample_count + 6 - i) % 6;
+					strcat(sendbuf, sample_buf[idx]);
+					strcat(sendbuf, "\n");
+				}
 #ifdef WIRELESS_ESPNOW
-				printf("[CLIENT %d] Sending: %d bytes in %d ms\n", CLIENT_ID, (int)strlen(buf_packet), timeSinceLast);
-				if (esp_now_send(broadcastAddress, (uint8_t *)buf_packet, strlen(buf_packet) + 1) != ESP_OK)
-					printf("Error sending data\n");
-#elif defined(WIRELESS_TCP)
-				if (client.connected())
-				{
-					client.print(buf);
-					printf("Sent via TCP: %s", buf);
+				if (!esp_now_is_peer_exist(broadcastAddress)) {
+					esp_now_peer_info_t peer = {};
+					memcpy(peer.peer_addr, broadcastAddress, 6);
+					peer.channel = 0;
+					peer.encrypt = false;
+					esp_now_add_peer(&peer);
 				}
-				else
-				{
-					printf("TCP disconnected...reconnect\n");
-					if (!client.connect(serverIP, PORT))
-						printf("Reconnection failed\n");
+				//printf("[CLIENT %d] TDMA SEND: %d bytes\n", CLIENT_ID, (int)strlen(sendbuf));
+				size_t msglen = strlen(sendbuf) + 1;
+				if (msglen > 250) msglen = 250; // ESPNOW最大ペイロード制限
+				if (sendQueue != NULL) {
+					SendItem item;
+					memcpy(item.addr, broadcastAddress, 6);
+					memcpy(item.data, sendbuf, msglen);
+					item.len = msglen;
+					if (xQueueSend(sendQueue, &item, pdMS_TO_TICKS(10)) != pdTRUE) {
+						printf("client: sendQueue full - drop packet\n");
+					}
+				} else {
+					if (esp_now_send(broadcastAddress, (uint8_t *)sendbuf, msglen) != ESP_OK)
+						printf("Error sending data\n");
 				}
-#elif defined(WIRELESS_UDP)
-				printf("Sending via UDP to %s:%d: %s", serverIP, PORT, buf);
-				udp.beginPacket(serverIP, PORT);
-				udp.print(buf);
-				if (!udp.endPacket())
-					printf("Error sending UDP packet\n");
 #endif
+				last_sent_beacon_seq = last_beacon_seq;
 			}
-			strcpy(buf_packet, "");
 		}
 	}
 }
