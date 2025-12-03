@@ -1,16 +1,16 @@
+
 // KA_W Client
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Ticker.h>
 #include <FastLED.h>
+#include <MadgwickAHRS.h>
+#include "bmi270_config.h"
+#include <math.h>
 
-#define CLIENT_ID 2 // 1または2に設定（2台目は2に変更）
+#define CLIENT_ID 1 // 1または2に設定（2台目は2に変更）
 #define NUM_CLIENTS 2
-
-#define CMD_START 0x01
-#define CMD_STOP 0x02
-#define CMD_STATUS 0x03
 
 Ticker ticker;
 #define SAMPLE_FREQ 250
@@ -118,14 +118,6 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 		printf("Last Packet Send Status = FAILED");
 	//	else
 	//		printf("Last Packet Send Status = SUCCESS");
-	/*
-	if (lastCommandSent == CMD_START)
-			printf(" (command: START)\n");
-		else if (lastCommandSent == CMD_STOP)
-			printf(" (command: STOP)\n");
-		else
-			printf("\n");
-	*/
 }
 
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
@@ -198,9 +190,40 @@ uint16_t n = 0;
 
 uint32_t lastReceiveTime, currentTime;
 
-// 4msごとにダミーデータをバッファし、TDMAスロット進入時に最新から12個分まとめて送信
-char sample_buf[12][32];
+
+// 4msごとにIMU+MadgwickでYaw/Roll/Pitch（1000倍6桁整数×3連結）をバッファし、TDMAスロット進入時に最新から12個分まとめて送信
+char sample_buf[12][20]; // 1バッファ=18文字+1(終端)
 uint8_t sample_count = 0;
+
+// --- IMU/Madgwick用変数 ---
+#define I2C_ADDR_IMU0 0x68
+Madgwick madgwick;
+float ax, ay, az, gx, gy, gz;
+float roll, pitch, yaw;
+
+// I2Cラッパ（M5Unified Ex_I2C使用）
+static bool readIMU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
+	uint8_t buf[20];
+	// BMI270 acc/gyroデータレジスタ: 0x0C～0x1F
+	if (!M5.Ex_I2C.readRegister(I2C_ADDR_IMU0, 0x0C, buf, 20, 400000)) return false;
+	// 加速度: 16bit, ±2g, little endian, 1LSB=0.061mg
+	int16_t ax_raw = (int16_t)(buf[1] << 8 | buf[0]);
+	int16_t ay_raw = (int16_t)(buf[3] << 8 | buf[2]);
+	int16_t az_raw = (int16_t)(buf[5] << 8 | buf[4]);
+	// ジャイロ: 16bit, ±2000dps, little endian, 1LSB=0.061mg
+	int16_t gx_raw = (int16_t)(buf[9] << 8 | buf[8]);
+	int16_t gy_raw = (int16_t)(buf[11] << 8 | buf[10]);
+	int16_t gz_raw = (int16_t)(buf[13] << 8 | buf[12]);
+	// スケーリング
+	ax = ax_raw * 0.061f * 0.001f * 9.80665f; // m/s^2
+	ay = ay_raw * 0.061f * 0.001f * 9.80665f;
+	az = az_raw * 0.061f * 0.001f * 9.80665f;
+	gx = gx_raw * 2000.0f / 32768.0f * (M_PI / 180.0f); // rad/s
+	gy = gy_raw * 2000.0f / 32768.0f * (M_PI / 180.0f);
+	gz = gz_raw * 2000.0f / 32768.0f * (M_PI / 180.0f);
+	return true;
+}
+
 
 void loop()
 {
@@ -208,17 +231,37 @@ void loop()
 	while (fSample == 0)
 		delayMicroseconds(10);
 
-	// 1桁のID + 18桁のランダム数値（合計19文字）
-	char id = '0' + CLIENT_ID;
-	char numstr[20];
-	for (int i = 0; i < 18; i++) {
-		numstr[i] = '0' + (rand() % 10);
+	// IMUサンプリング・Madgwickフィルタ適用
+	if (readIMU(ax, ay, az, gx, gy, gz)) {
+		madgwick.updateIMU(gx, gy, gz, ax, ay, az);
+		roll = madgwick.getRoll();   // degree
+		pitch = madgwick.getPitch(); // degree
+		yaw = madgwick.getYaw();     // degree
+	} else {
+		roll = pitch = yaw = 0.0f;
 	}
-	numstr[0] = '0' + (sample_count / 10);
-	numstr[1] = '0' + (sample_count % 10);
-	numstr[18] = '\0';
+
+
+	// 1000倍・6桁ゼロ埋め整数化
+	int iroll = (int)roundf(roll * 1000.0f);
+	int ipitch = (int)roundf(pitch * 1000.0f);
+	int iyaw = (int)roundf(yaw * 1000.0f);
+	char id = '0' + CLIENT_ID;
+	// 1桁ID + 6桁Yaw + 6桁Roll + 6桁Pitch（合計19文字, 先頭0埋め）
+	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%c%06d%06d%06d", id, iyaw, iroll, ipitch);
+
+	// --- Teleplot形式で10サンプルに1回のみ出力 ---
+	static int teleplot_counter = 0;
+	teleplot_counter++;
+	if (teleplot_counter >= 10) {
+		teleplot_counter = 0;
+		// Teleplot形式: "teleplot:変数名 値"
+		printf("teleplot:Yaw %.3f\n", yaw);
+		printf("teleplot:Roll %.3f\n", roll);
+		printf("teleplot:Pitch %.3f\n", pitch);
+	}
+
 	sample_count = (sample_count + 1) % 12;
-	sprintf(sample_buf[sample_count], "%c%s", id, numstr);
 
 	if (last_beacon_ms == 0) return;
 	uint32_t now = millis();
@@ -226,15 +269,13 @@ void loop()
 	uint32_t my_slot_start = (CLIENT_ID - 1) * TDMA_SLOT_MS;
 	if (offset >= my_slot_start && offset < my_slot_start + TDMA_SLOT_WINDOW_MS) {
 		if (last_sent_beacon_seq != last_beacon_seq) {
-			//printf("[CLIENT %d] Enter TDMA slot at %lu ms (offset=%lu, slot_start=%lu)\n", CLIENT_ID, (unsigned long)now, (unsigned long)offset, (unsigned long)my_slot_start);
 			char sendbuf[400] = "";
-			//printf("sample_count = %d\n",	 sample_count);
 			for (int i = 0; i < 12; i++) {
 				int idx = (sample_count + i) % 12;
 				strcat(sendbuf, sample_buf[idx]);
-				//printf("%d %d %d\n", idx, strlen(sample_buf[idx]), strlen(sendbuf));
 			}
-			//strcat(sendbuf, "\n");
+			size_t msglen = strlen(sendbuf) + 1;
+			if (msglen > 250) msglen = 250; // ESPNOW最大ペイロード制限
 			if (!esp_now_is_peer_exist(broadcastAddress)) {
 				esp_now_peer_info_t peer = {};
 				memcpy(peer.peer_addr, broadcastAddress, 6);
@@ -242,9 +283,6 @@ void loop()
 				peer.encrypt = false;
 				esp_now_add_peer(&peer);
 			}
-			//printf("[CLIENT %d] TDMA SEND: %d bytes\n", CLIENT_ID, (int)strlen(sendbuf));
-			size_t msglen = strlen(sendbuf) + 1;
-			if (msglen > 250) msglen = 250; // ESPNOW最大ペイロード制限
 			if (sendQueue != NULL) {
 				SendItem item;
 				memcpy(item.addr, broadcastAddress, 6);
