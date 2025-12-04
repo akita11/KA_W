@@ -5,9 +5,7 @@
 #include <WiFiUdp.h>
 #include <Ticker.h>
 #include <FastLED.h>
-#include <MadgwickAHRS.h>
-#include "bmi270_config.h"
-#include <math.h>
+#include "imu.h"
 
 #define CLIENT_ID 1 // 1または2に設定（2台目は2に変更）
 #define NUM_CLIENTS 2
@@ -139,12 +137,42 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
 	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
 }
 
+
 void setup()
 {
-	M5.begin();
+	auto cfg = M5.config();
+	cfg.external_imu = false;
+	cfg.internal_imu = false;
+	cfg.internal_spk = false;
+	cfg.internal_mic = false;
+
+	// I2C clock is defined in Unified/src/utility/imu/IMU_Base.hpp
+	M5.begin(cfg);
+	M5.Ex_I2C.begin();
+
 	initFastLEDFallback();
 	fastled_leds[0] = CRGB(0, 30, 0);
 	FastLED.show();
+
+	// IMUの初期化（エラーチェック付き）
+	fastled_leds[0] = CRGB(30, 0, 0); // 初期化中は赤
+	FastLED.show();
+
+	int result;
+	while(IMUinit(I2C_ADDR_IMU) != BMI270_OK) delay(10);
+	if (result != BMI270_OK)
+	{
+		while (1)
+		{
+			fastled_leds[0] = CRGB::Red; FastLED.show(); delay(200);
+			fastled_leds[0] = CRGB::Black; FastLED.show(); delay(200);
+		}
+	}
+
+	fastled_leds[0] = CRGB(0, 30, 0); // green
+	FastLED.show();
+
+	madgwick.begin(SAMPLE_FREQ);
 
 	WiFi.mode(WIFI_MODE_STA);
 	if (esp_now_init() != ESP_OK)
@@ -190,40 +218,9 @@ uint16_t n = 0;
 
 uint32_t lastReceiveTime, currentTime;
 
-
 // 4msごとにIMU+MadgwickでYaw/Roll/Pitch（1000倍6桁整数×3連結）をバッファし、TDMAスロット進入時に最新から12個分まとめて送信
 char sample_buf[12][20]; // 1バッファ=18文字+1(終端)
 uint8_t sample_count = 0;
-
-// --- IMU/Madgwick用変数 ---
-#define I2C_ADDR_IMU0 0x68
-Madgwick madgwick;
-float ax, ay, az, gx, gy, gz;
-float roll, pitch, yaw;
-
-// I2Cラッパ（M5Unified Ex_I2C使用）
-static bool readIMU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
-	uint8_t buf[20];
-	// BMI270 acc/gyroデータレジスタ: 0x0C～0x1F
-	if (!M5.Ex_I2C.readRegister(I2C_ADDR_IMU0, 0x0C, buf, 20, 400000)) return false;
-	// 加速度: 16bit, ±2g, little endian, 1LSB=0.061mg
-	int16_t ax_raw = (int16_t)(buf[1] << 8 | buf[0]);
-	int16_t ay_raw = (int16_t)(buf[3] << 8 | buf[2]);
-	int16_t az_raw = (int16_t)(buf[5] << 8 | buf[4]);
-	// ジャイロ: 16bit, ±2000dps, little endian, 1LSB=0.061mg
-	int16_t gx_raw = (int16_t)(buf[9] << 8 | buf[8]);
-	int16_t gy_raw = (int16_t)(buf[11] << 8 | buf[10]);
-	int16_t gz_raw = (int16_t)(buf[13] << 8 | buf[12]);
-	// スケーリング
-	ax = ax_raw * 0.061f * 0.001f * 9.80665f; // m/s^2
-	ay = ay_raw * 0.061f * 0.001f * 9.80665f;
-	az = az_raw * 0.061f * 0.001f * 9.80665f;
-	gx = gx_raw * 2000.0f / 32768.0f * (M_PI / 180.0f); // rad/s
-	gy = gy_raw * 2000.0f / 32768.0f * (M_PI / 180.0f);
-	gz = gz_raw * 2000.0f / 32768.0f * (M_PI / 180.0f);
-	return true;
-}
-
 
 void loop()
 {
@@ -241,7 +238,6 @@ void loop()
 		roll = pitch = yaw = 0.0f;
 	}
 
-
 	// 1000倍・6桁ゼロ埋め整数化
 	int iroll = (int)roundf(roll * 1000.0f);
 	int ipitch = (int)roundf(pitch * 1000.0f);
@@ -255,10 +251,14 @@ void loop()
 	teleplot_counter++;
 	if (teleplot_counter >= 10) {
 		teleplot_counter = 0;
+/*
 		// Teleplot形式: "teleplot:変数名 値"
 		printf("teleplot:Yaw %.3f\n", yaw);
 		printf("teleplot:Roll %.3f\n", roll);
 		printf("teleplot:Pitch %.3f\n", pitch);
+		*/
+//		printf("%d %.3f %.3f %.3f / %.3f %.3f %.3f / %.1f %.1f %.1f\n", millis() % 1000, ax, ay, az, gx, gy, gz, yaw, roll, pitch);
+		printf("%d %.1f %.1f %.1f\n", millis() % 1000, yaw, roll, pitch);
 	}
 
 	sample_count = (sample_count + 1) % 12;
