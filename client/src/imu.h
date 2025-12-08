@@ -71,7 +71,7 @@
 extern Madgwick madgwick;
 extern float ax, ay, az, gx, gy, gz;
 extern float roll, pitch, yaw;
-#define I2C_ADDR_IMU 0x69 // ID=1
+#define I2C_ADDR_IMU 0x68 // ID=0
 
 // 関数宣言
 int conv_value(uint8_t dh, uint8_t dl);

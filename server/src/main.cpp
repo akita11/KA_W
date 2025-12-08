@@ -2,6 +2,8 @@
 // Configuration
 // PC--[USB]--KAW[S] <---[ESPNow]--> KAW[C]
 
+#define NUM_CLIENTS 2
+
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -28,6 +30,14 @@ extern uint16_t nThroughputSamples;
 volatile uint8_t beaconEnabled = 0; // STARTで1, STOPで0
 
 volatile uint8_t fReceived = 0;
+volatile uint32_t prevReceiveTime = 0;
+volatile char prevClientID = 0;
+
+// データ保持用配列: CLIENT x 12サンプル の yaw, roll, pitch
+float client_yaw[NUM_CLIENTS][12];
+float client_roll[NUM_CLIENTS][12];
+float client_pitch[NUM_CLIENTS][12];
+volatile uint32_t lastDisplayTime = 0;
 
 // FastLED fallback
 #define FALLBACK_NUM_LEDS 1
@@ -56,53 +66,89 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
 	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
 }
 
+uint8_t nShowDebug = 0;
+uint32_t sampleSeq = 0;
+
 // Task to process received items
 void recvTask(void *pvParameters) {
 	RecvItem item;
 	for (;;) {
 		if (xQueueReceive(recvQueue, &item, portMAX_DELAY) == pdTRUE) {
 			uint32_t currentTime = millis();
-			/*
-			if (item.len == 1) {
-				uint8_t cmd = item.data[0];
-				printf("[%d ms] Command received from ", currentTime);
-				for (int i = 0; i < 6; i++) {
-					printf("%02X", item.mac[i]);
-					if (i < 5) printf(":");
-				}
-				printf(": ");
-				switch (cmd) {
-				case CMD_START:
-					printf("START\n");
-					break;
-				case CMD_STOP:
-					printf("STOP\n");
-					break;
-				default:
-					printf("UNKNOWN (0x%02X)\n", cmd);
-					break;
-				}
-				continue;
-			}
-			*/
+/*
+			nShowDebug++;
+			if (nShowDebug < 2){
 			// データ受信時に内容とmillis()を表示
-			/*
-			printf("[SERVER] Data received at %lu ms: %d bytes\n", (unsigned long)currentTime, item.len);
-			for (int i = 0; i < item.len; i++) {
-				char c = item.data[i];
-				if (c >= 32 && c <= 126) putchar(c); else putchar('.');
+				printf("[SERVER] Data received at %lu ms: %d bytes\n", (unsigned long)currentTime, item.len);
+				for (int i = 0; i < item.len; i++) {
+					char c = item.data[i];
+					if (c >= 32 && c <= 126) putchar(c); else putchar('.');
+				}
+				putchar('\n');
 			}
-			putchar('\n');
-			*/
+			nShowDebug = (nShowDebug + 1) % 24;
+*/
+			//printf("%d %c\n", currentTime - lastReceiveTime, item.data[0]);
+			//printf("%s\n", item.data);
+			char id = item.data[0];
+			// 交互受信チェック
+			if (prevClientID != 0 && ((prevClientID == '1' && id != '2') || (prevClientID == '2' && id != '1'))) {
+				printf("Error: Expected CLIENT %c but received %c\n", (prevClientID == '1') ? '2' : '1', id);
+				fastled_leds[0] = CRGB(30, 0, 0); // 赤
+				FastLED.show();
+			}
+			prevClientID = id;
+			// データパースと格納
+			for (uint8_t i = 0; i < 12; i++){
+				char sample[19];
+				memcpy(sample, &item.data[1 + i * 18], 18);
+				sample[18] = '\0';
+				char yaw_str[7], roll_str[7], pitch_str[7];
+				memcpy(yaw_str, &sample[0], 6); yaw_str[6] = '\0';
+				memcpy(roll_str, &sample[6], 6); roll_str[6] = '\0';
+				memcpy(pitch_str, &sample[12], 6); pitch_str[6] = '\0';
+				int iyaw = atoi(yaw_str);
+				int iroll = atoi(roll_str);
+				int ipitch = atoi(pitch_str);
+				float yaw = iyaw / 1000.0f;
+				float roll = iroll / 1000.0f;
+				float pitch = ipitch / 1000.0f;
+				int client_idx = id - '1'; // '1' -> 0, '2' -> 1
+				client_yaw[client_idx][i] = yaw;
+				client_roll[client_idx][i] = roll;
+				client_pitch[client_idx][i] = pitch;
+			}
+			// CLIENT=2受信後に全データ表示
+			if (id == '2') {
+				uint32_t now = millis();
+				uint32_t elapsed = (lastDisplayTime == 0) ? 0 : (now - lastDisplayTime);
+				//printf("Elapsed: %d ms\n", elapsed);
+				for (int i = 0; i < 12; i++) {
+//					printf("%d %.3f %.3f %.3f %.3f %.3f %.3f\n", sampleSeq++, client_yaw[0][i], client_roll[0][i], client_pitch[0][i], client_yaw[1][i], client_roll[1][i], client_pitch[1][i]);
+				}
+				lastDisplayTime = now;
+			}				
+			lastReceiveTime = currentTime;
 			fReceived = (fReceived + 1) % 10;
-			if (fReceived < 5) {
-				fastled_leds[0] = CRGB(0, 0, 30);
+			uint32_t interval = (prevReceiveTime == 0) ? 0 : (currentTime - prevReceiveTime);
+			uint8_t clientID = item.data[0] - '0';
+			//printf("Received %d bytes from %d Interval: %lu ms\n", item.len, clientID, (unsigned long)interval);
+			if (interval > 40) { // 受信間隔が24msよりも大幅に長い場合
+				if (fReceived < 5) {
+					fastled_leds[0] = CRGB(30, 0, 30); // 赤紫
+				} else {
+					fastled_leds[0] = CRGB(30, 0, 0); // 赤
+				}
 			} else {
-				fastled_leds[0] = CRGB(30, 30, 0);
+				if (fReceived < 5) {
+					fastled_leds[0] = CRGB(0, 0, 30); // 青
+				} else {
+					fastled_leds[0] = CRGB(30, 30, 0); // 黄
+				}
 			}
 			FastLED.show();
 			// スループット計算
-			lastReceiveTime = currentTime;
+			prevReceiveTime = currentTime;
 			nThroughputSamples++;
 			if (nThroughputSamples == SERVER_THROUGHPUT_SAMPLE) {
 				uint32_t timeSinceLast = (previousThroughputSamplingTime == 0) ? 0 : (currentTime - previousThroughputSamplingTime);
@@ -117,6 +163,7 @@ void recvTask(void *pvParameters) {
 
 #define SAMPLE_FREQ 250
 // TDMA parameters
+
 #define TDMA_FRAME_MS 48 // Frame period in milliseconds (12サンプル x 4ms)
 #define TDMA_BEACON0 0    // beacon payload first byte marker
 #define TDMA_BEACON1 1    // beacon payload second byte marker
@@ -183,6 +230,8 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 //	else printf("Last Packet Send Status = SUCCESS");
 }
 
+uint32_t lastBeaconSentTime = 0;
+
 void setup()
 {
 	M5.begin();
@@ -195,6 +244,7 @@ void setup()
 
 	// Initialize ESP-NOW in STA mode (simpler, avoids AP overhead)
 	WiFi.mode(WIFI_MODE_STA);
+	WiFi.channel(1); // チャンネルを固定して通信安定化
 	vTaskDelay(pdMS_TO_TICKS(100));
 	if (esp_now_init() != ESP_OK)
 	{
@@ -240,6 +290,8 @@ void setup()
 		xQueueSendFromISR(sendQueue, &item, &xHigherPriorityTaskWoken);
 		if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
 		//printf("[SERVER] Beacon sent at %lu ms\n", millis());
+//		printf("%d\n", millis() - lastBeaconSentTime);
+//		lastBeaconSentTime = millis();
 	});
 }
 
@@ -252,8 +304,9 @@ void loop()
 
 	if (M5.BtnA.wasClicked()) {
 		beaconEnabled = !beaconEnabled;
-		printf("beaconEnabled = %d\n", beaconEnabled);
+		//printf("beaconEnabled = %d\n", beaconEnabled);
 		if (beaconEnabled) {
+			sampleSeq = 0;
 			fastled_leds[0] = CRGB(30, 30, 0);
 		} else {
 			delay(100);

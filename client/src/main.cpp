@@ -7,7 +7,7 @@
 #include <FastLED.h>
 #include "imu.h"
 
-#define CLIENT_ID 1 // 1または2に設定（2台目は2に変更）
+#define CLIENT_ID 1 // 1 or 2
 #define NUM_CLIENTS 2
 
 Ticker ticker;
@@ -15,7 +15,7 @@ Ticker ticker;
 #define FALLBACK_NUM_LEDS 1
 
 // TDMA parameters (must match server)
-#define TDMA_FRAME_MS 24
+#define TDMA_FRAME_MS 48
 #define TDMA_SLOT_MS (TDMA_FRAME_MS / NUM_CLIENTS)
 // Slot guard window (ms) used to decide whether to send in slot
 #define TDMA_SLOT_WINDOW_MS (TDMA_SLOT_MS - 4)
@@ -23,6 +23,8 @@ Ticker ticker;
 volatile uint32_t last_beacon_ms = 0; // updated when beacon received
 volatile uint32_t last_beacon_seq = 0; // ビーコンごとにインクリメント
 volatile uint32_t last_sent_beacon_seq = 0; // 送信したビーコンのシーケンス
+volatile uint32_t expected_beacon_seq = 0; // 期待されるビーコンシーケンス
+volatile bool beacon_lost = false; // ビーコン受信ミスフラグ
 // Communication task and queue for client
 typedef struct {
 	uint8_t addr[6];
@@ -52,11 +54,22 @@ void recvTask(void *pvParameters) {
 			uint32_t currentTime = millis();
 			// Beacon detection: 2-byte beacon {0xBE,0xAC}
 			if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
+				uint32_t interval = (last_beacon_ms == 0) ? 0 : (currentTime - last_beacon_ms);
+				printf("[CLIENT %d] Interval: %d ms, Seq: %d", CLIENT_ID, interval, last_beacon_seq + 1);
+				bool hasLost = false;
+				if (expected_beacon_seq > 0 && last_beacon_seq + 1 != expected_beacon_seq) {
+					uint32_t lost = (last_beacon_seq + 1) - expected_beacon_seq;
+					printf(" (Lost: %d)", lost);
+					hasLost = true;
+				}
+				printf("\n");
+				beacon_lost = hasLost;
 				last_beacon_ms = currentTime;
 				last_beacon_seq++;
-				//printf("[CLIENT %d] Beacon received at %lu ms\n", CLIENT_ID, (unsigned long)currentTime);
+				expected_beacon_seq = last_beacon_seq + 1;
 				continue;
 			}
+			/*
 			// Generic data print
 			printf("[%d ms] Received %d bytes from: ", currentTime, item.len);
 			for (int i = 0; i < 6; i++) {
@@ -66,6 +79,7 @@ void recvTask(void *pvParameters) {
 			printf(": ");
 			for (int i = 0; i < item.len; i++) printf("%c", item.data[i]);
 			printf("\n");
+			*/
 		}
 	}
 }
@@ -91,7 +105,7 @@ int packetCount = 0;
 char buf[1024];
 char buf_packet[1024];
 
-static CRGB fastled_leds[FALLBACK_NUM_LEDS];
+CRGB fastled_leds[FALLBACK_NUM_LEDS];
 static bool fastled_initialized = false;
 static int fastled_pin = -1;
 
@@ -175,6 +189,7 @@ void setup()
 	madgwick.begin(SAMPLE_FREQ);
 
 	WiFi.mode(WIFI_MODE_STA);
+	WiFi.channel(1); // チャンネルを固定して通信安定化
 	if (esp_now_init() != ESP_OK)
 	{
 		printf("Error initializing ESP-NOW\n");
@@ -221,46 +236,62 @@ uint32_t lastReceiveTime, currentTime;
 // 4msごとにIMU+MadgwickでYaw/Roll/Pitch（1000倍6桁整数×3連結）をバッファし、TDMAスロット進入時に最新から12個分まとめて送信
 char sample_buf[12][20]; // 1バッファ=18文字+1(終端)
 uint8_t sample_count = 0;
+//uint8_t sampleSeq = 0;
 
 void loop()
 {
+	// LED制御: ビーコン受信ミスがあれば赤、なければ緑
+	if (beacon_lost) {
+		fastled_leds[0] = CRGB(30, 0, 0); // 赤
+	} else {
+		fastled_leds[0] = CRGB(0, 30, 0); // 緑
+	}
+	FastLED.show();
+
 	fSample = 0;
 	while (fSample == 0)
 		delayMicroseconds(10);
-
 	// IMUサンプリング・Madgwickフィルタ適用
 	if (readIMU(ax, ay, az, gx, gy, gz)) {
 		madgwick.updateIMU(gx, gy, gz, ax, ay, az);
 		roll = madgwick.getRoll();   // degree
 		pitch = madgwick.getPitch(); // degree
 		yaw = madgwick.getYaw();     // degree
+		// test data
+		//yaw = (float)sampleSeq + 0.123;
+		//roll = (float)sampleSeq + 0.456;
+		//pitch = (float)sampleSeq + 0.789;
+		//sampleSeq++;
 	} else {
 		roll = pitch = yaw = 0.0f;
 	}
+
+	while(roll < 0.0f) roll += 360.0f;
+	while(yaw < 0.0f) yaw += 360.0f;
+	while(pitch < 0.0f) pitch += 360.0f;
 
 	// 1000倍・6桁ゼロ埋め整数化
 	int iroll = (int)roundf(roll * 1000.0f);
 	int ipitch = (int)roundf(pitch * 1000.0f);
 	int iyaw = (int)roundf(yaw * 1000.0f);
-	char id = '0' + CLIENT_ID;
-	// 1桁ID + 6桁Yaw + 6桁Roll + 6桁Pitch（合計19文字, 先頭0埋め）
-	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%c%06d%06d%06d", id, iyaw, iroll, ipitch);
-
+	// 6桁Yaw + 6桁Roll + 6桁Pitch（合計18文字, 先頭0埋め）
+	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%06d%06d%06d", iyaw, iroll, ipitch);
+	/*
 	// --- Teleplot形式で10サンプルに1回のみ出力 ---
 	static int teleplot_counter = 0;
 	teleplot_counter++;
 	if (teleplot_counter >= 10) {
 		teleplot_counter = 0;
-/*
 		// Teleplot形式: "teleplot:変数名 値"
 		printf("teleplot:Yaw %.3f\n", yaw);
 		printf("teleplot:Roll %.3f\n", roll);
 		printf("teleplot:Pitch %.3f\n", pitch);
-		*/
 //		printf("%d %.3f %.3f %.3f / %.3f %.3f %.3f / %.1f %.1f %.1f\n", millis() % 1000, ax, ay, az, gx, gy, gz, yaw, roll, pitch);
-		printf("%d %.1f %.1f %.1f\n", millis() % 1000, yaw, roll, pitch);
+//		printf("%d %.1f %.1f %.1f\n", millis() % 1000, yaw, roll, pitch);
+//		printf("%s\n", sample_buf[sample_count]);
 	}
 
+	*/
 	sample_count = (sample_count + 1) % 12;
 
 	if (last_beacon_ms == 0) return;
@@ -270,6 +301,7 @@ void loop()
 	if (offset >= my_slot_start && offset < my_slot_start + TDMA_SLOT_WINDOW_MS) {
 		if (last_sent_beacon_seq != last_beacon_seq) {
 			char sendbuf[400] = "";
+			sprintf(sendbuf, "%c", '0' + CLIENT_ID);
 			for (int i = 0; i < 12; i++) {
 				int idx = (sample_count + i) % 12;
 				strcat(sendbuf, sample_buf[idx]);
