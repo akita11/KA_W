@@ -69,6 +69,9 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
 uint8_t nShowDebug = 0;
 uint32_t sampleSeq = 0;
 
+uint32_t t0 = 0;
+float roll0[2], pitch0[2], yaw0[2];
+
 // Task to process received items
 void recvTask(void *pvParameters) {
 	RecvItem item;
@@ -123,8 +126,13 @@ void recvTask(void *pvParameters) {
 				uint32_t now = millis();
 				uint32_t elapsed = (lastDisplayTime == 0) ? 0 : (now - lastDisplayTime);
 				//printf("Elapsed: %d ms\n", elapsed);
+				uint32_t t1 = micros();
+				uint32_t tm = t1 - t0;
+				t0 = t1;
 				for (int i = 0; i < 12; i++) {
-//					printf("%d %.3f %.3f %.3f %.3f %.3f %.3f\n", sampleSeq++, client_yaw[0][i], client_roll[0][i], client_pitch[0][i], client_yaw[1][i], client_roll[1][i], client_pitch[1][i]);
+//				printf("%d %.3f %.3f %.3f %.3f %.3f %.3f\n", sampleSeq++, client_yaw[0][i], client_roll[0][i], client_pitch[0][i], client_yaw[1][i], client_roll[1][i], client_pitch[1][i]);
+//				printf("Dir:,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", tm + i * 4000, client_roll[0][i] - roll0[0], client_pitch[0][i] - pitch0[0], client_yaw[0][i] - yaw0[0], client_roll[1][i] - roll0[1], client_pitch[1][i] - pitch0[1], client_yaw[1][i] - yaw0[1]);
+				printf(",%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", tm/12, client_roll[0][i] - roll0[0], client_pitch[0][i] - pitch0[0], client_yaw[0][i] - yaw0[0], client_roll[1][i] - roll0[1], client_pitch[1][i] - pitch0[1], client_yaw[1][i] - yaw0[1]);
 				}
 				lastDisplayTime = now;
 			}				
@@ -154,7 +162,7 @@ void recvTask(void *pvParameters) {
 				uint32_t timeSinceLast = (previousThroughputSamplingTime == 0) ? 0 : (currentTime - previousThroughputSamplingTime);
 				float avgTime = (float)timeSinceLast / (float)SERVER_THROUGHPUT_SAMPLE;
 				nThroughputSamples = 0;
-				printf("Average interval: %.2f ms / %d - %d\n", avgTime, currentTime, previousThroughputSamplingTime);
+				//printf("Average interval: %.2f ms / %d - %d\n", avgTime, currentTime, previousThroughputSamplingTime);
 				previousThroughputSamplingTime = currentTime;
 			}
 		}
@@ -200,7 +208,6 @@ int packetCount = 0;																							 // Current number of packets in buff
 
 //char buf[1025];
 
-uint32_t t0;
 uint32_t lastReceiveTime = 0; // Track last receive time for SERVER
 // Throughput measurement (server)
 #define SERVER_THROUGHPUT_SAMPLE 100
@@ -308,6 +315,11 @@ void loop()
 		if (beaconEnabled) {
 			sampleSeq = 0;
 			fastled_leds[0] = CRGB(30, 30, 0);
+			for (int8_t i = 0; i < 2; i++){
+				roll0[i] = 0.0;
+				pitch0[i] = 0.0;
+				yaw0[i] = 0.0;
+			}
 		} else {
 			delay(100);
 			fastled_leds[0] = CRGB(0, 30, 0);
@@ -318,3 +330,5 @@ void loop()
 	// No polling needed, data is received asynchronously
 	delay(100);
 }
+
+//			roll0[i] = roll[i]; pitch0[i] = pitch[i]; yaw0[i] = yaw[i];
