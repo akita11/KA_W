@@ -199,7 +199,9 @@ void loop()
 	// beacon: every 48ms
 #define BEACON_CHECK_CYCLE 6
 	uint8_t cnt = last_beacon_seq % BEACON_CHECK_CYCLE; // cycle=288ms (3.47Hz)
-	if ((last_beacon_seq % BEACON_CHECK_CYCLE) < BEACON_CHECK_CYCLE) fastled_leds[0] = CRGB(0, 30, 0);
-	else fastled_leds[0] = CRGB(0, 0, 30);
+	if (beacon_lost == true) fastled_leds[0] = CRGB(30, 0, 0);
+	else
+		if ((last_beacon_seq % BEACON_CHECK_CYCLE) < BEACON_CHECK_CYCLE) fastled_leds[0] = CRGB(0, 30, 0);
+		else fastled_leds[0] = CRGB(0, 0, 30);
 	FastLED.show();
 }
