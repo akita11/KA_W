@@ -8,10 +8,6 @@
 Ticker ticker;
 #define SAMPLE_FREQ 250
 #define FALLBACK_NUM_LEDS 1
-#define CALIB_STATE_NONE 0
-#define CALIB_STATE_STARTED 1
-#define CALIB_STATE_DONE 2
-uint8_t stCalibrate = CALIB_STATE_NONE;
 
 // TDMA parameters (must match server)
 #define TDMA_FRAME_MS 48
@@ -54,7 +50,7 @@ void recvTask(void *pvParameters) {
 			// Beacon detection: 2-byte beacon {0xBE,0xAC}
 			if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
 				uint32_t interval = (last_beacon_ms == 0) ? 0 : (currentTime - last_beacon_ms);
-				printf("Beacon interval: %d ms / 48ms), Seq: %d", interval, last_beacon_seq + 1);
+				//printf("Beacon interval: %d ms / 48ms), Seq: %d", interval, last_beacon_seq + 1);
 				bool hasLost = false;
 				if (expected_beacon_seq > 0 && last_beacon_seq + 1 != expected_beacon_seq) {
 					uint32_t lost = (last_beacon_seq + 1) - expected_beacon_seq;
@@ -145,9 +141,7 @@ void setup()
 	cfg.internal_spk = false;
 	cfg.internal_mic = false;
 
-	// I2C clock is defined in Unified/src/utility/imu/IMU_Base.hpp
 	M5.begin(cfg);
-	M5.Ex_I2C.begin();
 
 	initFastLEDFallback();
 	fastled_leds[0] = CRGB(0, 30, 0);
@@ -199,9 +193,19 @@ void loop()
 	// beacon: every 48ms
 #define BEACON_CHECK_CYCLE 6
 	uint8_t cnt = last_beacon_seq % BEACON_CHECK_CYCLE; // cycle=288ms (3.47Hz)
-	if (beacon_lost == true) fastled_leds[0] = CRGB(30, 0, 0);
-	else
-		if ((last_beacon_seq % BEACON_CHECK_CYCLE) < BEACON_CHECK_CYCLE) fastled_leds[0] = CRGB(0, 30, 0);
-		else fastled_leds[0] = CRGB(0, 0, 30);
+	if (beacon_lost == true){
+		fastled_leds[0] = CRGB(30, 0, 0);
+	}
+	else{
+		if ((last_beacon_seq % BEACON_CHECK_CYCLE) < BEACON_CHECK_CYCLE / 2)
+		{
+			fastled_leds[0] = CRGB(0, 30, 0);
+		}
+		else
+		{
+			fastled_leds[0] = CRGB(0, 0, 30);
+		}
+	}
 	FastLED.show();
+	delay(4);
 }
