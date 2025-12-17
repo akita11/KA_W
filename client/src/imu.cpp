@@ -1,10 +1,6 @@
 #include "imu.h"
 #include "bmi270_config.h"
 
-// IMU関連変数定義
-Madgwick madgwick;
-float ax, ay, az, gx, gy, gz;
-float roll, pitch, yaw;
 
 int conv_value(uint8_t dh, uint8_t dl)
 {
@@ -161,20 +157,4 @@ int IMUinit(uint8_t i2c_addr)
 	writeRegB(i2c_addr, 0x7d, 0x0f);  // temp en | ACC en | GYR en | AUX en
 
 	return BMI270_OK;
-}
-
-bool readIMU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
-	uint8_t buf[20];
-	// BMI270 acc/gyroデータレジスタ: 0x0C～0x1F
-	if (!readReg(I2C_ADDR_IMU, BMI270_REG_AUX_DATA, buf, 20)) return(false);
-	//mx = (float)(conv_value(buf[1], buf[0]) >> 3); // 13bit (+-4096)
-	//my = (float)(conv_value(buf[3], buf[2]) >> 3); // 13bit (+-4096)
-	//mz = (float)(conv_value(buf[5], buf[4]) >> 1); // 15bit (+-16384)
-	ax = (float)conv_value(buf[ 9], buf[ 8]) / 16384.0f; // [g]
-	ay = (float)conv_value(buf[11], buf[10]) / 16384.0f;
-	az = (float)conv_value(buf[13], buf[12]) / 16384.0f;
-	gx = (float)conv_value(buf[15], buf[14]) / 32768.0f * 2000.0f; // [dps]
-	gy = (float)conv_value(buf[17], buf[16]) / 32768.0f * 2000.0f;
-	gz = (float)conv_value(buf[19], buf[18]) / 32768.0f * 2000.0f;
-	return true;
 }

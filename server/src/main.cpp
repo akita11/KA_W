@@ -70,7 +70,7 @@ uint8_t nShowDebug = 0;
 uint32_t sampleSeq = 0;
 
 uint32_t t0 = 0;
-float roll0[2], pitch0[2], yaw0[2];
+
 
 // Task to process received items
 void recvTask(void *pvParameters) {
@@ -132,7 +132,7 @@ void recvTask(void *pvParameters) {
 				for (int i = 0; i < 12; i++) {
 //				printf("%d %.3f %.3f %.3f %.3f %.3f %.3f\n", sampleSeq++, client_yaw[0][i], client_roll[0][i], client_pitch[0][i], client_yaw[1][i], client_roll[1][i], client_pitch[1][i]);
 //				printf("Dir:,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", tm + i * 4000, client_roll[0][i] - roll0[0], client_pitch[0][i] - pitch0[0], client_yaw[0][i] - yaw0[0], client_roll[1][i] - roll0[1], client_pitch[1][i] - pitch0[1], client_yaw[1][i] - yaw0[1]);
-				printf(",%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", tm/12, client_roll[0][i] - roll0[0], client_pitch[0][i] - pitch0[0], client_yaw[0][i] - yaw0[0], client_roll[1][i] - roll0[1], client_pitch[1][i] - pitch0[1], client_yaw[1][i] - yaw0[1]);
+				printf(",%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", tm/12, client_roll[0][i], client_pitch[0][i], client_yaw[0][i], client_roll[1][i], client_pitch[1][i], client_yaw[1][i]);
 				}
 				lastDisplayTime = now;
 			}				
@@ -315,11 +315,6 @@ void loop()
 		if (beaconEnabled) {
 			sampleSeq = 0;
 			fastled_leds[0] = CRGB(30, 30, 0);
-			for (int8_t i = 0; i < 2; i++){
-				roll0[i] = 0.0;
-				pitch0[i] = 0.0;
-				yaw0[i] = 0.0;
-			}
 		} else {
 			delay(100);
 			fastled_leds[0] = CRGB(0, 30, 0);
@@ -330,5 +325,3 @@ void loop()
 	// No polling needed, data is received asynchronously
 	delay(100);
 }
-
-//			roll0[i] = roll[i]; pitch0[i] = pitch[i]; yaw0[i] = yaw[i];

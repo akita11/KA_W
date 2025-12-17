@@ -1,4 +1,3 @@
-
 // KA_W Client
 #include <M5Unified.h>
 #include <WiFi.h>
@@ -13,6 +12,20 @@
 Ticker ticker;
 #define SAMPLE_FREQ 250
 #define FALLBACK_NUM_LEDS 1
+#define CALIB_STATE_NONE 0
+#define CALIB_STATE_STARTED 1
+#define CALIB_STATE_DONE 2
+uint8_t stCalibrate = CALIB_STATE_NONE;
+
+float ax, ay, az;
+float gx, gy, gz;
+volatile int axRaw, ayRaw, azRaw;
+volatile int gxRaw, gyRaw, gzRaw;
+float gxOffset, gyOffset, gzOffset;
+long gxSum, gySum, gzSum;
+#define N_SAMPLE_CALIB (SAMPLE_FREQ * 4) // 4[s]
+//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
+uint16_t nSampleCalib = 0;
 
 // TDMA parameters (must match server)
 #define TDMA_FRAME_MS 48
@@ -44,6 +57,8 @@ typedef struct {
 
 static QueueHandle_t recvQueue = NULL;
 
+Madgwick madgwick;
+
 #include <esp_now.h>
 
 // Task to process received items (client)
@@ -55,14 +70,19 @@ void recvTask(void *pvParameters) {
 			// Beacon detection: 2-byte beacon {0xBE,0xAC}
 			if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
 				uint32_t interval = (last_beacon_ms == 0) ? 0 : (currentTime - last_beacon_ms);
-				printf("[CLIENT %d] Interval: %d ms, Seq: %d", CLIENT_ID, interval, last_beacon_seq + 1);
+				//printf("[CLIENT %d] Interval: %d ms, Seq: %d", CLIENT_ID, interval, last_beacon_seq + 1);
+				if (stCalibrate == CALIB_STATE_NONE){
+					stCalibrate = CALIB_STATE_STARTED;
+					gxSum = 0; gySum = 0; gzSum = 0;
+					gxOffset = 0; gyOffset = 0; gzOffset = 0;
+					//printf(" - Calibration started");
+				}
 				bool hasLost = false;
 				if (expected_beacon_seq > 0 && last_beacon_seq + 1 != expected_beacon_seq) {
 					uint32_t lost = (last_beacon_seq + 1) - expected_beacon_seq;
 					printf(" (Lost: %d)", lost);
 					hasLost = true;
 				}
-				printf("\n");
 				beacon_lost = hasLost;
 				last_beacon_ms = currentTime;
 				last_beacon_seq++;
@@ -151,7 +171,6 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
 	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
 }
 
-
 void setup()
 {
 	auto cfg = M5.config();
@@ -236,10 +255,13 @@ uint32_t lastReceiveTime, currentTime;
 // 4msごとにIMU+MadgwickでYaw/Roll/Pitch（1000倍6桁整数×3連結）をバッファし、TDMAスロット進入時に最新から12個分まとめて送信
 char sample_buf[12][20]; // 1バッファ=18文字+1(終端)
 uint8_t sample_count = 0;
-//uint8_t sampleSeq = 0;
+uint8_t sampleSeq = 0;
+
+volatile uint32_t micros0 = 0;
 
 void loop()
 {
+	float roll, pitch, yaw;
 	// LED制御: ビーコン受信ミスがあれば赤、なければ緑
 	if (beacon_lost) {
 		fastled_leds[0] = CRGB(30, 0, 0); // 赤
@@ -251,17 +273,57 @@ void loop()
 	fSample = 0;
 	while (fSample == 0)
 		delayMicroseconds(10);
-	// IMUサンプリング・Madgwickフィルタ適用
-	if (readIMU(ax, ay, az, gx, gy, gz)) {
-		madgwick.updateIMU(gx, gy, gz, ax, ay, az);
-		roll = madgwick.getRoll();   // degree
-		pitch = madgwick.getPitch(); // degree
-		yaw = madgwick.getYaw();     // degree
-		// test data
-		//yaw = (float)sampleSeq + 0.123;
-		//roll = (float)sampleSeq + 0.456;
-		//pitch = (float)sampleSeq + 0.789;
-		//sampleSeq++;
+
+	uint8_t buf[20];
+	// BMI270 acc/gyroデータレジスタ: 0x0C～0x1F
+	if (readReg(I2C_ADDR_IMU, BMI270_REG_AUX_DATA, buf, 20)){
+		// Process IMU data
+		axRaw = conv_value(buf[ 9], buf[ 8]);
+		ayRaw = conv_value(buf[11], buf[10]);
+		azRaw = conv_value(buf[13], buf[12]);
+		gxRaw = conv_value(buf[15], buf[14]);
+		gyRaw = conv_value(buf[17], buf[16]);
+		gzRaw = conv_value(buf[19], buf[18]);
+		ax = (float)axRaw / 32768.0f * ACC_MAX_MS2; // [g]
+		ay = (float)ayRaw / 32768.0f * ACC_MAX_MS2;
+		az = (float)azRaw / 32768.0f * ACC_MAX_MS2;
+		gx = (float)gxRaw / 32768.0f * GYRO_MAX_DPS; // [dps]
+		gy = (float)gyRaw / 32768.0f * GYRO_MAX_DPS;
+		gz = (float)gzRaw / 32768.0f * GYRO_MAX_DPS;
+		if (stCalibrate == CALIB_STATE_STARTED) {
+			fastled_leds[0] = CRGB(30, 10, 0); FastLED.show();
+			//printf("calibrating... %d / %d\r", nSampleCalib, N_SAMPLE_CALIB);
+			gxSum += gxRaw;
+			gySum += gyRaw;
+			gzSum += gzRaw;
+			nSampleCalib++;
+			if (nSampleCalib == N_SAMPLE_CALIB){
+				fastled_leds[0] = CRGB(0, 30, 0); FastLED.show();
+				stCalibrate = CALIB_STATE_DONE;
+				gxOffset = (float)(gxSum / N_SAMPLE_CALIB) / 32768.0f * GYRO_MAX_DPS; // [dps]
+				gyOffset = (float)(gySum / N_SAMPLE_CALIB	) / 32768.0f * GYRO_MAX_DPS; // [dps]
+				gzOffset = (float)(gzSum / N_SAMPLE_CALIB) / 32768.0f * GYRO_MAX_DPS; // [dps]
+				//printf("Calibration done: gxOffset=%.3f, gyOffset=%.3f, gzOffset=%.3f\n", gxOffset, gyOffset, gzOffset);
+			}
+		}
+		gx -= gxOffset;
+		gy -= gyOffset;
+		gz -= gzOffset;
+		if (stCalibrate == CALIB_STATE_DONE) {
+			madgwick.updateIMU(gx, gy, gz, ax, ay, az);
+			roll = madgwick.getRoll();   // degree
+			pitch = madgwick.getPitch(); // degree
+			yaw = madgwick.getYaw();     // degree
+			// test dummy data
+			yaw = (float)sampleSeq + 0.123;
+			roll = (float)sampleSeq + 0.456;
+			pitch = (float)sampleSeq + 0.789;
+			sampleSeq++;
+			// end of test dummy data
+			//uint32_t t = micros();
+			//printf("%d %.3f %3f %.3f\n", t - micros0, yaw, roll, pitch);
+			//micros0 = t;
+		}
 	} else {
 		roll = pitch = yaw = 0.0f;
 	}
@@ -275,6 +337,11 @@ void loop()
 	int ipitch = (int)roundf(pitch * 1000.0f);
 	int iyaw = (int)roundf(yaw * 1000.0f);
 	// 6桁Yaw + 6桁Roll + 6桁Pitch（合計18文字, 先頭0埋め）
+	if (sample_count == 0){
+		uint32_t t = micros();
+		printf("%d %d\n", t - micros0, sample_count);
+		micros0 = t;
+	}
 	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%06d%06d%06d", iyaw, iroll, ipitch);
 	/*
 	// --- Teleplot形式で10サンプルに1回のみ出力 ---
@@ -290,7 +357,6 @@ void loop()
 //		printf("%d %.1f %.1f %.1f\n", millis() % 1000, yaw, roll, pitch);
 //		printf("%s\n", sample_buf[sample_count]);
 	}
-
 	*/
 	sample_count = (sample_count + 1) % 12;
 
@@ -300,34 +366,37 @@ void loop()
 	uint32_t my_slot_start = (CLIENT_ID - 1) * TDMA_SLOT_MS;
 	if (offset >= my_slot_start && offset < my_slot_start + TDMA_SLOT_WINDOW_MS) {
 		if (last_sent_beacon_seq != last_beacon_seq) {
-			char sendbuf[400] = "";
-			sprintf(sendbuf, "%c", '0' + CLIENT_ID);
-			for (int i = 0; i < 12; i++) {
-				int idx = (sample_count + i) % 12;
-				strcat(sendbuf, sample_buf[idx]);
-			}
-			size_t msglen = strlen(sendbuf) + 1;
-			if (msglen > 250) msglen = 250; // ESPNOW最大ペイロード制限
-			if (!esp_now_is_peer_exist(broadcastAddress)) {
-				esp_now_peer_info_t peer = {};
-				memcpy(peer.peer_addr, broadcastAddress, 6);
-				peer.channel = 0;
-				peer.encrypt = false;
-				esp_now_add_peer(&peer);
-			}
-			if (sendQueue != NULL) {
-				SendItem item;
-				memcpy(item.addr, broadcastAddress, 6);
-				memcpy(item.data, sendbuf, msglen);
-				item.len = msglen;
-				if (xQueueSend(sendQueue, &item, pdMS_TO_TICKS(10)) != pdTRUE) {
-					printf("client: sendQueue full - drop packet\n");
+			if (stCalibrate == CALIB_STATE_DONE){
+				char sendbuf[400] = "";
+				sprintf(sendbuf, "%c", '0' + CLIENT_ID);
+				for (int i = 0; i < 12; i++) {
+					int idx = (sample_count + i) % 12;
+					strcat(sendbuf, sample_buf[idx]);
 				}
-			} else {
-				if (esp_now_send(broadcastAddress, (uint8_t *)sendbuf, msglen) != ESP_OK)
-					printf("Error sending data\n");
+				size_t msglen = strlen(sendbuf) + 1;
+				if (msglen > 250) msglen = 250; // ESPNOW最大ペイロード制限
+				if (!esp_now_is_peer_exist(broadcastAddress)) {
+					esp_now_peer_info_t peer = {};
+					memcpy(peer.peer_addr, broadcastAddress, 6);
+					peer.channel = 0;
+					peer.encrypt = false;
+					esp_now_add_peer(&peer);
+				}
+				if (sendQueue != NULL) {
+					SendItem item;
+					memcpy(item.addr, broadcastAddress, 6);
+					memcpy(item.data, sendbuf, msglen);
+					item.len = msglen;
+					printf("%d %d %s\n", sample_count, now, sendbuf);
+					if (xQueueSend(sendQueue, &item, pdMS_TO_TICKS(10)) != pdTRUE) {
+						printf("client: sendQueue full - drop packet\n");
+					}
+				} else {
+					if (esp_now_send(broadcastAddress, (uint8_t *)sendbuf, msglen) != ESP_OK)
+						printf("Error sending data\n");
+				}
+				last_sent_beacon_seq = last_beacon_seq;
 			}
-			last_sent_beacon_seq = last_beacon_seq;
 		}
 	}
 }

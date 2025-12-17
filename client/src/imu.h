@@ -68,9 +68,6 @@
 #define MAG_MAX_UT 1000.0f	 // Maximum magnetic field in μT
 
 // IMU関連変数
-extern Madgwick madgwick;
-extern float ax, ay, az, gx, gy, gz;
-extern float roll, pitch, yaw;
 #define I2C_ADDR_IMU 0x68 // ID=0
 
 // 関数宣言
@@ -78,7 +75,6 @@ int conv_value(uint8_t dh, uint8_t dl);
 bool auxWriteRegB(uint8_t i2c_addr, uint8_t reg, uint8_t data);
 int auxReadRegB(uint8_t i2c_addr, uint8_t reg);
 int IMUinit(uint8_t i2c_addr);
-bool readIMU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz);
 #define readReg(i2c_addr, reg_addr, data, len) M5.Ex_I2C.readRegister(i2c_addr, reg_addr, data, len, I2C_CLK_FREQ)
 
 #endif // IMU_H
