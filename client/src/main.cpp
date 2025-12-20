@@ -6,7 +6,7 @@
 #include <FastLED.h>
 #include "imu.h"
 
-#define CLIENT_ID 1 // 1 or 2
+#define CLIENT_ID 2 // 1 or 2
 #define NUM_CLIENTS 2
 
 Ticker ticker;
@@ -23,8 +23,9 @@ volatile int axRaw, ayRaw, azRaw;
 volatile int gxRaw, gyRaw, gzRaw;
 float gxOffset, gyOffset, gzOffset;
 long gxSum, gySum, gzSum;
-#define N_SAMPLE_CALIB (SAMPLE_FREQ * 4) // 4[s]
-//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
+//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 1) // 1[s]
+//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 4) // 4[s]
+#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
 uint16_t nSampleCalib = 0;
 
 // TDMA parameters (must match server)
@@ -70,7 +71,7 @@ void recvTask(void *pvParameters) {
 			// Beacon detection: 2-byte beacon {0xBE,0xAC}
 			if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
 				uint32_t interval = (last_beacon_ms == 0) ? 0 : (currentTime - last_beacon_ms);
-				//printf("[CLIENT %d] Interval: %d ms, Seq: %d", CLIENT_ID, interval, last_beacon_seq + 1);
+				//printf("[CLIENT %d] Interval: %d ms, Seq: %d\n", CLIENT_ID, interval, last_beacon_seq + 1);
 				if (stCalibrate == CALIB_STATE_NONE){
 					stCalibrate = CALIB_STATE_STARTED;
 					gxSum = 0; gySum = 0; gzSum = 0;
@@ -324,14 +325,12 @@ void loop()
 		roll = madgwick.getRoll();   // degree
 		pitch = madgwick.getPitch(); // degree
 		yaw = madgwick.getYaw();     // degree
-/*
 		// test dummy data
-		yaw = (float)sampleSeq + 0.123;
-		roll = (float)sampleSeq + 0.456;
-		pitch = (float)sampleSeq + 0.789;
+		//yaw = (float)sampleSeq + 0.123;
+		//roll = (float)sampleSeq + 0.456;
+		//pitch = (float)sampleSeq + 0.789;
 		sampleSeq++;
 		// end of test dummy data
-*/
 	}
 
 	while(roll < 0.0f) roll += 360.0f;
@@ -343,16 +342,9 @@ void loop()
 	int ipitch = (int)roundf(pitch * 1000.0f);
 	int iyaw = (int)roundf(yaw * 1000.0f);
 	// 6桁Yaw + 6桁Roll + 6桁Pitch（合計18文字, 先頭0埋め）
-/*
-	if (sample_count == 0){
-		uint32_t t = micros();
-		printf("%d %d\n", t - micros0, sample_count);
-		micros0 = t;
-	}
-*/
 	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%06d%06d%06d", iyaw, iroll, ipitch);
-	/*
 	// --- Teleplot形式で10サンプルに1回のみ出力 ---
+	/*
 	static int teleplot_counter = 0;
 	teleplot_counter++;
 	if (teleplot_counter >= 10) {
@@ -367,13 +359,6 @@ void loop()
 	}
 	*/
 	sample_count = (sample_count + 1) % 12;
-/*
-	if (sample_count == 0){
-		uint32_t t = micros();
-		printf("%d %.3f %3f %.3f\n", t - micros0, yaw, roll, pitch);
-		micros0 = t;
-	}
-*/
 	if (last_beacon_ms == 0) return;
 	uint32_t now = millis();
 	uint32_t offset = (now - last_beacon_ms) % TDMA_FRAME_MS;
@@ -401,7 +386,6 @@ void loop()
 					memcpy(item.addr, broadcastAddress, 6);
 					memcpy(item.data, sendbuf, msglen);
 					item.len = msglen;
-					//printf("# %d %d\n", sample_count, now);
 					if (xQueueSend(sendQueue, &item, pdMS_TO_TICKS(10)) != pdTRUE) {
 						printf("client: sendQueue full - drop packet\n");
 					}

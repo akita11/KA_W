@@ -19,7 +19,17 @@ typedef struct {
 	int len;
 } RecvItem;
 
+typedef struct {
+	char id;
+	float yaw[24];
+	float roll[24];
+	float pitch[24];
+	uint32_t tm;
+	uint8_t fAlternatingError;
+} DisplayItem;
+
 static QueueHandle_t recvQueue = NULL;
+static QueueHandle_t displayQueue = NULL;
 
 // Forward declarations for variables used in recvTask
 extern uint32_t lastReceiveTime;
@@ -71,6 +81,7 @@ uint32_t sampleSeq = 0;
 
 uint32_t t0 = 0;
 
+uint8_t fAlternatingReceiveError = 0;
 
 // Task to process received items
 void recvTask(void *pvParameters) {
@@ -96,10 +107,12 @@ void recvTask(void *pvParameters) {
 			char id = item.data[0];
 			// 交互受信チェック
 			if (prevClientID != 0 && ((prevClientID == '1' && id != '2') || (prevClientID == '2' && id != '1'))) {
-				printf("Error: Expected CLIENT %c but received %c\n", (prevClientID == '1') ? '2' : '1', id);
-				fastled_leds[0] = CRGB(30, 0, 0); // 赤
-				FastLED.show();
+				fAlternatingReceiveError = 1;
+				//printf("Error: Expected CLIENT %c but received %c\n", (prevClientID == '1') ? '2' : '1', id);
+				//fastled_leds[0] = CRGB(30, 0, 0); // 赤
+				//FastLED.show();
 			}
+			else fAlternatingReceiveError = 0;
 			prevClientID = id;
 			// データパースと格納
 			for (uint8_t i = 0; i < 12; i++){
@@ -122,18 +135,26 @@ void recvTask(void *pvParameters) {
 				client_pitch[client_idx][i] = pitch;
 			}
 			// CLIENT=2受信後に全データ表示
-			if (id == '2') {
+			if (id == '2' && beaconEnabled) {
 				uint32_t now = millis();
 				uint32_t elapsed = (lastDisplayTime == 0) ? 0 : (now - lastDisplayTime);
 				//printf("Elapsed: %d ms\n", elapsed);
 				uint32_t t1 = micros();
 				uint32_t tm = t1 - t0;
 				t0 = t1;
-				for (int i = 0; i < 12; i++) {
-//				printf("%d %.3f %.3f %.3f %.3f %.3f %.3f\n", sampleSeq++, client_yaw[0][i], client_roll[0][i], client_pitch[0][i], client_yaw[1][i], client_roll[1][i], client_pitch[1][i]);
-//				printf("Dir:,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", tm + i * 4000, client_roll[0][i] - roll0[0], client_pitch[0][i] - pitch0[0], client_yaw[0][i] - yaw0[0], client_roll[1][i] - roll0[1], client_pitch[1][i] - pitch0[1], client_yaw[1][i] - yaw0[1]);
-				printf(",%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", tm/12, client_roll[0][i], client_pitch[0][i], client_yaw[0][i], client_roll[1][i], client_pitch[1][i], client_yaw[1][i]);
+				char cAlternatingError = fAlternatingReceiveError ? '*' : ' ';
+				DisplayItem dispItem;
+				dispItem.id = id;
+				dispItem.tm = tm;
+				dispItem.fAlternatingError = fAlternatingReceiveError;
+				for (int c = 0; c < NUM_CLIENTS; c++) {
+					for (int i = 0; i < 12; i++) {
+						dispItem.yaw[c*12 + i] = client_yaw[c][i];
+						dispItem.roll[c*12 + i] = client_roll[c][i];
+						dispItem.pitch[c*12 + i] = client_pitch[c][i];
+					}
 				}
+				xQueueSend(displayQueue, &dispItem, 0);
 				lastDisplayTime = now;
 			}				
 			lastReceiveTime = currentTime;
@@ -141,6 +162,8 @@ void recvTask(void *pvParameters) {
 			uint32_t interval = (prevReceiveTime == 0) ? 0 : (currentTime - prevReceiveTime);
 			uint8_t clientID = item.data[0] - '0';
 			//printf("Received %d bytes from %d Interval: %lu ms\n", item.len, clientID, (unsigned long)interval);
+			// 受信間隔エラーをLED表示
+/*
 			if (interval > 40) { // 受信間隔が24msよりも大幅に長い場合
 				if (fReceived < 5) {
 					fastled_leds[0] = CRGB(30, 0, 30); // 赤紫
@@ -155,7 +178,9 @@ void recvTask(void *pvParameters) {
 				}
 			}
 			FastLED.show();
+*/
 			// スループット計算
+/*
 			prevReceiveTime = currentTime;
 			nThroughputSamples++;
 			if (nThroughputSamples == SERVER_THROUGHPUT_SAMPLE) {
@@ -165,14 +190,15 @@ void recvTask(void *pvParameters) {
 				//printf("Average interval: %.2f ms / %d - %d\n", avgTime, currentTime, previousThroughputSamplingTime);
 				previousThroughputSamplingTime = currentTime;
 			}
+*/
 		}
 	}
 }
 
 #define SAMPLE_FREQ 250
-// TDMA parameters
 
-#define TDMA_FRAME_MS 48 // Frame period in milliseconds (12サンプル x 4ms)
+// TDMA parameters
+#define TDMA_FRAME_MS 48	// Frame period in milliseconds (12サンプル x 4ms)
 #define TDMA_BEACON0 0    // beacon payload first byte marker
 #define TDMA_BEACON1 1    // beacon payload second byte marker
 Ticker beaconTicker;
@@ -242,6 +268,7 @@ uint32_t lastBeaconSentTime = 0;
 void setup()
 {
 	M5.begin();
+	Serial.setTxBufferSize(2048); // Increase TX buffer to reduce blocking
 
 	// Initialize FastLED fallback unconditionally (do not use M5.Led)
 	initFastLEDFallback();
@@ -284,7 +311,14 @@ void setup()
 	if (recvQueue == NULL) {
 		printf("Failed to create recvQueue\n");
 	} else {
-		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 0);
+		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 1);
+	}
+	// create display queue and task
+	displayQueue = xQueueCreate(4, sizeof(DisplayItem));
+	if (displayQueue == NULL) {
+		printf("Failed to create displayQueue\n");
+	} else {
+		// displayTask removed, handle in loop()
 	}
 	// setup()または初期化部で必ずbeaconTickerを起動
 	beaconTicker.attach_ms(TDMA_FRAME_MS, [](){
@@ -297,8 +331,8 @@ void setup()
 		xQueueSendFromISR(sendQueue, &item, &xHigherPriorityTaskWoken);
 		if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
 		//printf("[SERVER] Beacon sent at %lu ms\n", millis());
-//		printf("%d\n", millis() - lastBeaconSentTime);
-//		lastBeaconSentTime = millis();
+		//printf("%d\n", millis() - lastBeaconSentTime);
+		lastBeaconSentTime = millis();
 	});
 }
 
@@ -306,22 +340,44 @@ void loop()
 {
 	// Check for button press to send commands
 	M5.update();
-	static uint8_t lastButtonState = 0;
-	static uint32_t lastButtonTime = 0;
 
 	if (M5.BtnA.wasClicked()) {
 		beaconEnabled = !beaconEnabled;
-		//printf("beaconEnabled = %d\n", beaconEnabled);
+//		printf("beaconEnabled = %d\n", beaconEnabled);
 		if (beaconEnabled) {
 			sampleSeq = 0;
 			fastled_leds[0] = CRGB(30, 30, 0);
 		} else {
-			delay(100);
 			fastled_leds[0] = CRGB(0, 30, 0);
 		}
 		FastLED.show();
 	}
+	static uint8_t prevBeaconEnabled = 0;
+	if (prevBeaconEnabled != beaconEnabled) {
+		if (beaconEnabled == 0) {
+			xQueueReset(displayQueue);
+		}
+		prevBeaconEnabled = beaconEnabled;
+	}
+	// Handle display in loop
+	DisplayItem item;
+	if (xQueueReceive(displayQueue, &item, 0) == pdTRUE) {
+		if (beaconEnabled) {
+			char cAlternatingError = item.fAlternatingError ? '*' : ' ';
+			if (fAlternatingReceiveError == 1){
+				fastled_leds[0] = CRGB(30, 0, 0);
+			}
+			else{
+				fastled_leds[0] = CRGB(30, 30, 0);
+			}
+			FastLED.show();
+			for (int i = 0; i < 12; i++) {
+				if (!beaconEnabled) break;
+				printf("%c,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", cAlternatingError, item.tm/12, item.roll[i], item.pitch[i], item.yaw[i], item.roll[12+i], item.pitch[12+i], item.yaw[12+i]);
+			}
+		}
+	}
 	// ESP-NOW server receives data via callback (onDataRecv)
 	// No polling needed, data is received asynchronously
-	delay(100);
+	delay(10);
 }
