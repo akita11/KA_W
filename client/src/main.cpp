@@ -32,7 +32,7 @@ uint16_t nSampleCalib = 0;
 #define TDMA_FRAME_MS 48
 #define TDMA_SLOT_MS (TDMA_FRAME_MS / NUM_CLIENTS)
 // Slot guard window (ms) used to decide whether to send in slot
-#define TDMA_SLOT_WINDOW_MS (TDMA_SLOT_MS - 4)
+#define TDMA_SLOT_WINDOW_MS (TDMA_SLOT_MS - 1)
 
 volatile uint32_t last_beacon_ms = 0; // updated when beacon received
 volatile uint32_t last_beacon_seq = 0; // ビーコンごとにインクリメント
