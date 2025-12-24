@@ -6,15 +6,15 @@
 
 #include <M5Unified.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <WiFiServer.h>
+#include <WiFiClient.h>
 #include <Ticker.h>
 // FastLED for AtomS3 Lite onboard LED
 #include <FastLED.h>
-#include <esp_now.h>
 
 // Received data queue and task
 typedef struct {
-	uint8_t mac[6];
+	char clientID;
 	uint8_t data[256];
 	int len;
 } RecvItem;
@@ -55,26 +55,9 @@ static CRGB fastled_leds[FALLBACK_NUM_LEDS];
 static bool fastled_initialized = false;
 static int fastled_pin = -1;
 
-// Callback function for when data is received - enqueue and return quickly
-void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-	if (recvQueue == NULL) return;
-	RecvItem item;
-	memcpy(item.mac, mac, 6);
-	int copyLen = len;
-	if (copyLen > (int)sizeof(item.data)) copyLen = sizeof(item.data);
-	memcpy(item.data, incomingData, copyLen);
-	item.len = copyLen;
-
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	// try FromISR first (fast and safe if called in ISR-like context)
-	BaseType_t ok = xQueueSendFromISR(recvQueue, &item, &xHigherPriorityTaskWoken);
-	if (ok != pdTRUE) {
-		// fallback to non-ISR enqueue (non-blocking)
-		ok = xQueueSend(recvQueue, &item, 0);
-	}
-	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
-}
+// TCP server
+WiFiServer tcpServer(12345); // Port 12345
+WiFiClient clients[2]; // Assuming 2 clients
 
 uint8_t nShowDebug = 0;
 uint32_t sampleSeq = 0;
@@ -87,8 +70,35 @@ uint8_t fAlternatingReceiveError = 0;
 void recvTask(void *pvParameters) {
 	RecvItem item;
 	for (;;) {
-		if (xQueueReceive(recvQueue, &item, portMAX_DELAY) == pdTRUE) {
-			uint32_t currentTime = millis();
+		// Check for new clients
+		WiFiClient newClient = tcpServer.available();
+		if (newClient) {
+			for (int i = 0; i < NUM_CLIENTS; i++) {
+				if (!clients[i]) {
+					clients[i] = newClient;
+					printf("Client %d connected\n", i+1);
+					break;
+				}
+			}
+		}
+
+		// Read data from clients
+		for (int i = 0; i < NUM_CLIENTS; i++) {
+			if (clients[i] && clients[i].available()) {
+				int len = clients[i].readBytes((char*)item.data, sizeof(item.data));
+				if (len > 0) {
+					item.clientID = '1' + i; // '1' for i=0, '2' for i=1
+					item.len = len;
+					processReceivedData(item);
+				}
+			}
+		}
+		vTaskDelay(pdMS_TO_TICKS(10)); // Small delay
+	}
+}
+
+void processReceivedData(RecvItem item) {
+	uint32_t currentTime = millis();
 /*
 			nShowDebug++;
 			if (nShowDebug < 2){
@@ -205,7 +215,6 @@ Ticker beaconTicker;
 
 // Communication task and queue
 typedef struct {
-	uint8_t addr[6];
 	uint8_t data[32];
 	size_t len;
 } SendItem;
@@ -215,13 +224,15 @@ static TaskHandle_t commTaskHandle = NULL;
 
 void commTask(void *pvParameters) {
 	SendItem item;
-	vTaskDelay(pdMS_TO_TICKS(500)); // Wait for WiFi/ESP-NOW to fully initialize
+	vTaskDelay(pdMS_TO_TICKS(500)); // Wait for WiFi/TCP to fully initialize
 	for(;;) {
 		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE) {
 			vTaskDelay(pdMS_TO_TICKS(2)); // Small delay before send
-			esp_err_t res = esp_now_send(item.addr, item.data, item.len);
-			if (res != ESP_OK) {
-				printf("commTask: esp_now_send failed %d\n", res);
+			// Send to all connected clients
+			for (int i = 0; i < NUM_CLIENTS; i++) {
+				if (clients[i] && clients[i].connected()) {
+					clients[i].write(item.data, item.len);
+				}
 			}
 		}
 	}
@@ -276,28 +287,15 @@ void setup()
 	fastled_leds[0] = CRGB(0, 30, 0);
 	FastLED.show();
 
-	// Initialize ESP-NOW in STA mode (simpler, avoids AP overhead)
-	WiFi.mode(WIFI_MODE_STA);
-	WiFi.channel(1); // チャンネルを固定して通信安定化
-	vTaskDelay(pdMS_TO_TICKS(100));
-	if (esp_now_init() != ESP_OK)
-	{
-		printf("Error initializing ESP-NOW\n");
-		return;
-	}
-	// Register receive callback
-	esp_now_register_recv_cb(onDataRecv);
-	// Register send callback so we can observe send results on server as well
-	esp_now_register_send_cb(onDataSent);
-	// Register broadcast peer explicitly before starting beacon
-	if (!esp_now_is_peer_exist(broadcastAddress)) {
-		esp_now_peer_info_t peer = {};
-		memcpy(peer.peer_addr, broadcastAddress, 6);
-		peer.channel = 0;
-		peer.encrypt = false;
-		esp_now_add_peer(&peer);
-	}
-	printf("ESP-NOW initialized in STA mode (receiving)\n");
+	// Initialize WiFi in AP mode for TCP server
+	WiFi.mode(WIFI_AP);
+	WiFi.softAP("KAW_Server", "password123"); // SSID and password
+	IPAddress IP = WiFi.softAPIP();
+	printf("AP IP address: %s\n", IP.toString().c_str());
+
+	// Start TCP server
+	tcpServer.begin();
+	printf("TCP server started on port 12345\n");
 	vTaskDelay(pdMS_TO_TICKS(100)); // Small delay after ESP-NOW init
 	// create send queue and communication task (pinned to core 0)
 	sendQueue = xQueueCreate(10, sizeof(SendItem));
@@ -325,7 +323,6 @@ void setup()
 		if (!beaconEnabled) return;
 		if (sendQueue == NULL) return;
 		SendItem item;
-		memcpy(item.addr, broadcastAddress, 6);
 		item.data[0] = 0xBE; item.data[1] = 0xAC; item.len = 2;
 		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 		xQueueSendFromISR(sendQueue, &item, &xHigherPriorityTaskWoken);
@@ -377,7 +374,7 @@ void loop()
 			}
 		}
 	}
-	// ESP-NOW server receives data via callback (onDataRecv)
-	// No polling needed, data is received asynchronously
+	// TCP server handles connections asynchronously
+	// No polling needed, data is received in recvTask
 	delay(10);
 }
