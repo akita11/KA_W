@@ -1,7 +1,7 @@
 // KA_W Client
 #include <M5Unified.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <WiFiClient.h>
 #include <Ticker.h>
 #include <FastLED.h>
 
@@ -32,23 +32,23 @@ static TaskHandle_t commTaskHandle = NULL;
 
 // Received data queue and task
 typedef struct {
-	uint8_t mac[6];
 	uint8_t data[256];
 	int len;
 } RecvItem;
 
 static QueueHandle_t recvQueue = NULL;
 
-#include <esp_now.h>
+// TCP client
+WiFiClient tcpClient;
 
 // Task to process received items (client)
 void recvTask(void *pvParameters) {
-	RecvItem item;
 	for(;;) {
-		if (xQueueReceive(recvQueue, &item, portMAX_DELAY) == pdTRUE) {
-			uint32_t currentTime = millis();
-			// Beacon detection: 2-byte beacon {0xBE,0xAC}
-			if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
+		if (tcpClient.available()) {
+			uint8_t data[256];
+			int len = tcpClient.readBytes((char*)data, sizeof(data));
+			if (len == 2 && data[0] == 0xBE && data[1] == 0xAC) {
+				uint32_t currentTime = millis();
 				uint32_t interval = (last_beacon_ms == 0) ? 0 : (currentTime - last_beacon_ms);
 				//printf("Beacon interval: %d ms / 48ms), Seq: %d", interval, last_beacon_seq + 1);
 				bool hasLost = false;
@@ -61,9 +61,9 @@ void recvTask(void *pvParameters) {
 				last_beacon_ms = currentTime;
 				last_beacon_seq++;
 				expected_beacon_seq = last_beacon_seq + 1;
-				continue;
 			}
 		}
+		vTaskDelay(pdMS_TO_TICKS(10));
 	}
 }
 
@@ -77,7 +77,6 @@ void commTask(void *pvParameters) {
 			}
 			vTaskDelay(pdMS_TO_TICKS(1));
 		}
-	}
 }
 
 #include <esp_now.h>
@@ -106,33 +105,6 @@ static void initFastLEDFallback()
 
 volatile uint32_t micros0 = 0;
 
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
-{
-	if (status != ESP_NOW_SEND_SUCCESS)
-		printf("Last Packet Send Status = FAILED");
-	//	else
-	//		printf("Last Packet Send Status = SUCCESS");
-}
-
-void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-	// enqueue received data to recvQueue for processing in recvTask
-	if (recvQueue == NULL) return;
-	RecvItem item;
-	memcpy(item.mac, mac, 6);
-	int copyLen = len;
-	if (copyLen > (int)sizeof(item.data)) copyLen = sizeof(item.data);
-	memcpy(item.data, incomingData, copyLen);
-	item.len = copyLen;
-
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	BaseType_t ok = xQueueSendFromISR(recvQueue, &item, &xHigherPriorityTaskWoken);
-	if (ok != pdTRUE) {
-		ok = xQueueSend(recvQueue, &item, 0);
-	}
-	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
-}
-
 void setup()
 {
 	auto cfg = M5.config();
@@ -147,39 +119,26 @@ void setup()
 	fastled_leds[0] = CRGB(0, 30, 0);
 	FastLED.show();
 
-	WiFi.mode(WIFI_MODE_STA);
-	WiFi.channel(1); // チャンネルを固定して通信安定化
+	// Connect to WiFi AP
+	WiFi.begin("KAW_Server", "password123");
+	while (WiFi.status() != WL_CONNECTED) {
+		delay(500);
+	}
+	printf("Connected to WiFi\n");
+
+	// Connect to TCP server
+	if (tcpClient.connect("192.168.4.1", 12345)) { // Server IP, assuming default AP IP
+		printf("Connected to TCP server\n");
+	} else {
+		printf("Failed to connect to TCP server\n");
+	}
 	if (esp_now_init() != ESP_OK)
 	{
 		printf("Error initializing ESP-NOW\n");
 		return;
 	}
-	esp_now_register_send_cb(onDataSent);
-	esp_now_register_recv_cb(onDataRecv);
-	esp_now_peer_info_t peerInfo = {};
-	memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-	peerInfo.channel = 0;
-	peerInfo.encrypt = false;
-	if (esp_now_add_peer(&peerInfo) != ESP_OK)
-	{
-		printf("Failed to add peer\n");
-		return;
-	}
-	printf("ESP-NOW initialized in STA mode (sending)\nBroadcast peer added\n");
-	// create send queue and communication task (pinned to core 0)
-	sendQueue = xQueueCreate(8, sizeof(SendItem));
-	if (sendQueue == NULL) {
-		printf("client: Failed to create sendQueue\n");
-	} else {
-		xTaskCreatePinnedToCore(commTask, "CommTask", 4096, NULL, configMAX_PRIORITIES-2, &commTaskHandle, 0);
-	}
-	// create receive queue and task
-	recvQueue = xQueueCreate(16, sizeof(RecvItem));
-	if (recvQueue == NULL) {
-		printf("client: Failed to create recvQueue\n");
-	} else {
-		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 0);
-	}
+	// create receive task
+	xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 0);
 
 	packetCount = 0;
 	memset(packetBuffer, 0, sizeof(packetBuffer));
