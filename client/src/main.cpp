@@ -1,7 +1,7 @@
 // KA_W Client
 #include <M5Unified.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <WiFiClient.h>
 #include <Ticker.h>
 #include <FastLED.h>
 #include "imu.h"
@@ -41,7 +41,6 @@ volatile uint32_t expected_beacon_seq = 0; // 期待されるビーコンシー�
 volatile bool beacon_lost = false; // ビーコン受信ミスフラグ
 // Communication task and queue for client
 typedef struct {
-	uint8_t addr[6];
 	uint8_t data[256];
 	size_t len;
 } SendItem;
@@ -51,7 +50,6 @@ static TaskHandle_t commTaskHandle = NULL;
 
 // Received data queue and task
 typedef struct {
-	uint8_t mac[6];
 	uint8_t data[256];
 	int len;
 } RecvItem;
@@ -60,48 +58,40 @@ static QueueHandle_t recvQueue = NULL;
 
 Madgwick madgwick;
 
-#include <esp_now.h>
-
 // Task to process received items (client)
 void recvTask(void *pvParameters) {
 	RecvItem item;
 	for(;;) {
-		if (xQueueReceive(recvQueue, &item, portMAX_DELAY) == pdTRUE) {
-			uint32_t currentTime = millis();
-			// Beacon detection: 2-byte beacon {0xBE,0xAC}
-			if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
-				uint32_t interval = (last_beacon_ms == 0) ? 0 : (currentTime - last_beacon_ms);
-				//printf("[CLIENT %d] Interval: %d ms, Seq: %d\n", CLIENT_ID, interval, last_beacon_seq + 1);
-				if (stCalibrate == CALIB_STATE_NONE){
-					stCalibrate = CALIB_STATE_STARTED;
-					gxSum = 0; gySum = 0; gzSum = 0;
-					gxOffset = 0; gyOffset = 0; gzOffset = 0;
-					//printf(" - Calibration started");
+		if (tcpClient.available()) {
+			int len = tcpClient.readBytes((char*)item.data, sizeof(item.data));
+			if (len > 0) {
+				item.len = len;
+				uint32_t currentTime = millis();
+				// Beacon detection: 2-byte beacon {0xBE,0xAC}
+				if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
+					uint32_t interval = (last_beacon_ms == 0) ? 0 : (currentTime - last_beacon_ms);
+					//printf("[CLIENT %d] Interval: %d ms, Seq: %d\n", CLIENT_ID, interval, last_beacon_seq + 1);
+					if (stCalibrate == CALIB_STATE_NONE){
+						stCalibrate = CALIB_STATE_STARTED;
+						gxSum = 0; gySum = 0; gzSum = 0;
+						gxOffset = 0; gyOffset = 0; gzOffset = 0;
+						//printf(" - Calibration started");
+					}
+					bool hasLost = false;
+					if (expected_beacon_seq > 0 && last_beacon_seq + 1 != expected_beacon_seq) {
+						uint32_t lost = (last_beacon_seq + 1) - expected_beacon_seq;
+						printf(" (Lost: %d)", lost);
+						hasLost = true;
+					}
+					beacon_lost = hasLost;
+					last_beacon_ms = currentTime;
+					last_beacon_seq++;
+					expected_beacon_seq = last_beacon_seq + 1;
+					continue;
 				}
-				bool hasLost = false;
-				if (expected_beacon_seq > 0 && last_beacon_seq + 1 != expected_beacon_seq) {
-					uint32_t lost = (last_beacon_seq + 1) - expected_beacon_seq;
-					printf(" (Lost: %d)", lost);
-					hasLost = true;
-				}
-				beacon_lost = hasLost;
-				last_beacon_ms = currentTime;
-				last_beacon_seq++;
-				expected_beacon_seq = last_beacon_seq + 1;
-				continue;
 			}
-			/*
-			// Generic data print
-			printf("[%d ms] Received %d bytes from: ", currentTime, item.len);
-			for (int i = 0; i < 6; i++) {
-				printf("%02X", item.mac[i]);
-				if (i < 5) printf(":");
-			}
-			printf(": ");
-			for (int i = 0; i < item.len; i++) printf("%c", item.data[i]);
-			printf("\n");
-			*/
 		}
+		vTaskDelay(pdMS_TO_TICKS(10));
 	}
 }
 
@@ -109,19 +99,16 @@ void commTask(void *pvParameters) {
 	SendItem item;
 	for(;;) {
 		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE) {
-			esp_err_t res = esp_now_send(item.addr, item.data, item.len);
-			if (res != ESP_OK) {
-				printf("client commTask: esp_now_send failed %d\n", res);
+			if (tcpClient.connected()) {
+				tcpClient.write(item.data, item.len);
 			}
 			vTaskDelay(pdMS_TO_TICKS(1));
 		}
 	}
 }
 
-#include <esp_now.h>
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-char packetBuffer[256];
-int packetCount = 0;
+// TCP client
+WiFiClient tcpClient;
 
 char buf[1024];
 char buf_packet[1024];
@@ -254,25 +241,19 @@ void setup()
 
 	madgwick.begin(SAMPLE_FREQ);
 
-	WiFi.mode(WIFI_MODE_STA);
-	WiFi.channel(1); // チャンネルを固定して通信安定化
-	if (esp_now_init() != ESP_OK)
-	{
-		printf("Error initializing ESP-NOW\n");
-		return;
+	// Connect to WiFi AP
+	WiFi.begin("KAW_Server", "password123");
+	while (WiFi.status() != WL_CONNECTED) {
+		delay(500);
 	}
-	esp_now_register_send_cb(onDataSent);
-	esp_now_register_recv_cb(onDataRecv);
-	esp_now_peer_info_t peerInfo = {};
-	memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-	peerInfo.channel = 0;
-	peerInfo.encrypt = false;
-	if (esp_now_add_peer(&peerInfo) != ESP_OK)
-	{
-		printf("Failed to add peer\n");
-		return;
+	printf("Connected to WiFi\n");
+
+	// Connect to TCP server
+	if (tcpClient.connect("192.168.4.1", 12345)) { // Server IP, assuming default AP IP
+		printf("Connected to TCP server\n");
+	} else {
+		printf("Failed to connect to TCP server\n");
 	}
-	printf("ESP-NOW initialized in STA mode (sending)\nBroadcast peer added\n");
 	// create send queue and communication task (pinned to core 0)
 	sendQueue = xQueueCreate(8, sizeof(SendItem));
 	if (sendQueue == NULL) {
@@ -373,25 +354,14 @@ void loop()
 					strcat(sendbuf, sample_buf[idx]);
 				}
 				size_t msglen = strlen(sendbuf) + 1;
-				if (msglen > 250) msglen = 250; // ESPNOW最大ペイロード制限
-				if (!esp_now_is_peer_exist(broadcastAddress)) {
-					esp_now_peer_info_t peer = {};
-					memcpy(peer.peer_addr, broadcastAddress, 6);
-					peer.channel = 0;
-					peer.encrypt = false;
-					esp_now_add_peer(&peer);
-				}
+				if (msglen > 250) msglen = 250; // TCP payload limit
 				if (sendQueue != NULL) {
 					SendItem item;
-					memcpy(item.addr, broadcastAddress, 6);
 					memcpy(item.data, sendbuf, msglen);
 					item.len = msglen;
 					if (xQueueSend(sendQueue, &item, pdMS_TO_TICKS(10)) != pdTRUE) {
 						printf("client: sendQueue full - drop packet\n");
 					}
-				} else {
-					if (esp_now_send(broadcastAddress, (uint8_t *)sendbuf, msglen) != ESP_OK)
-						printf("Error sending data\n");
 				}
 				last_sent_beacon_seq = last_beacon_seq;
 			}
