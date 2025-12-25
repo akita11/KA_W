@@ -5,15 +5,14 @@
 #include <Ticker.h>
 #include <FastLED.h>
 
+#define CLIENT_ID 1 // or 2, but for beaconChecker, maybe not needed
+#define NUM_CLIENTS 2
+
 Ticker ticker;
 #define SAMPLE_FREQ 250
 #define FALLBACK_NUM_LEDS 1
 
-// TDMA parameters (must match server)
-#define TDMA_FRAME_MS 48
-#define TDMA_SLOT_MS (TDMA_FRAME_MS / NUM_CLIENTS)
-// Slot guard window (ms) used to decide whether to send in slot
-#define TDMA_SLOT_WINDOW_MS (TDMA_SLOT_MS - 1)
+// TDMA not used in beaconChecker; timing handled elsewhere if needed
 
 volatile uint32_t last_beacon_ms = 0; // updated when beacon received
 volatile uint32_t last_beacon_seq = 0; // ビーコンごとにインクリメント
@@ -67,20 +66,6 @@ void recvTask(void *pvParameters) {
 	}
 }
 
-void commTask(void *pvParameters) {
-	SendItem item;
-	for(;;) {
-		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE) {
-			esp_err_t res = esp_now_send(item.addr, item.data, item.len);
-			if (res != ESP_OK) {
-				printf("client commTask: esp_now_send failed %d\n", res);
-			}
-			vTaskDelay(pdMS_TO_TICKS(1));
-		}
-}
-
-#include <esp_now.h>
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 char packetBuffer[256];
 int packetCount = 0;
 
@@ -131,11 +116,6 @@ void setup()
 		printf("Connected to TCP server\n");
 	} else {
 		printf("Failed to connect to TCP server\n");
-	}
-	if (esp_now_init() != ESP_OK)
-	{
-		printf("Error initializing ESP-NOW\n");
-		return;
 	}
 	// create receive task
 	xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 0);
