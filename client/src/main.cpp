@@ -6,7 +6,7 @@
 #include <FastLED.h>
 #include "imu.h"
 
-#define CLIENT_ID 2 // 1 or 2
+#define CLIENT_ID 1 // 1 or 2
 
 //#define USE_TCP
 
@@ -28,9 +28,9 @@ volatile int axRaw, ayRaw, azRaw;
 volatile int gxRaw, gyRaw, gzRaw;
 float gxOffset, gyOffset, gzOffset;
 long gxSum, gySum, gzSum;
-#define N_SAMPLE_CALIB (SAMPLE_FREQ * 1) // 1[s]
+//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 1) // 1[s]
 // #define N_SAMPLE_CALIB (SAMPLE_FREQ * 4) // 4[s]
-//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
+#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
 uint16_t nSampleCalib = 0;
 
 // START-controlled operation
@@ -435,9 +435,9 @@ void loop()
 		pitch = madgwick.getPitch(); // degree
 		yaw = madgwick.getYaw();		 // degree
 		// test dummy data
-		yaw = (float)sampleSeq + 0.123;
-		roll = (float)sampleSeq + 0.456;
-		pitch = (float)sampleSeq + 0.789;
+		//yaw = (float)sampleSeq + 0.123;
+		//roll = (float)sampleSeq + 0.456;
+		//pitch = (float)sampleSeq + 0.789;
 		sampleSeq++;
 		// end of test dummy data
 	}

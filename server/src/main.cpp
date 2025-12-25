@@ -248,17 +248,17 @@ void processReceivedData(RecvItem item)
 static void printAndResetIntervalAverages()
 {
 	DBG_PRINT("[SERVER] Per-client average receive interval (ms) for last session:\n");
+	printf("#");
 	for (int i = 0; i < NUM_CLIENTS; ++i)
 	{
-		printf("#");
 		if (count_intervals[i] == 0)
 		{
-			printf("%d,-,-,", i + 1);
+			printf("%d,0,-,", i + 1);
 		}
 		else
 		{
-			uint32_t avg = (uint32_t)(sum_intervals_ms[i] / count_intervals[i]);
-			printf("%d,%lu,%u,", i + 1, (unsigned long)avg, count_intervals[i]);
+			double avg = (double)sum_intervals_ms[i] / (double)count_intervals[i];
+			printf("%d,%.2f,%u,", i + 1, avg, count_intervals[i]);
 		}
 		// reset accumulators and last receive time for next session
 		sum_intervals_ms[i] = 0;
