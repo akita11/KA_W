@@ -4,13 +4,22 @@
 #include <WiFiUdp.h>
 #include <Ticker.h>
 #include <FastLED.h>
+#include <Preferences.h>
 #include "imu.h"
 
-#define CLIENT_ID 2 // 1 or 2
-#define NUM_CLIENTS 2
+// ToModigy: move q0-q3 in MadgwickAHRS.h from private to pubric
+// memo: q0=scalar, q1,q2,q3=vector
+
+#define CLIENT_ID 1 // 1 or 2
+
+//#define USE_TCP
+
+//#define DEBUG
 
 Ticker ticker;
 #define SAMPLE_FREQ 250
+//#define STAGGER_MS 12 // per-client start offset in ms (CLIENT_ID 1 -> 0ms, 2 -> STAGGER_MS)
+#define STAGGER_MS 0 // per-client start offset in ms (CLIENT_ID 1 -> 0ms, 2 -> STAGGER_MS)
 #define FALLBACK_NUM_LEDS 1
 #define CALIB_STATE_NONE 0
 #define CALIB_STATE_STARTED 1
@@ -25,23 +34,27 @@ float gxOffset, gyOffset, gzOffset;
 long gxSum, gySum, gzSum;
 //#define N_SAMPLE_CALIB (SAMPLE_FREQ * 1) // 1[s]
 //#define N_SAMPLE_CALIB (SAMPLE_FREQ * 4) // 4[s]
-#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
+//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
+#define N_SAMPLE_CALIB (SAMPLE_FREQ * 30) // 30[s]
 uint16_t nSampleCalib = 0;
 
-// TDMA parameters (must match server)
-#define TDMA_FRAME_MS 48
-#define TDMA_SLOT_MS (TDMA_FRAME_MS / NUM_CLIENTS)
-// Slot guard window (ms) used to decide whether to send in slot
-#define TDMA_SLOT_WINDOW_MS (TDMA_SLOT_MS - 1)
-
-volatile uint32_t last_beacon_ms = 0; // updated when beacon received
-volatile uint32_t last_beacon_seq = 0; // ビーコンごとにインクリメント
-volatile uint32_t last_sent_beacon_seq = 0; // 送信したビーコンのシーケンス
-volatile uint32_t expected_beacon_seq = 0; // 期待されるビーコンシーケンス
-volatile bool beacon_lost = false; // ビーコン受信ミスフラグ
+// START-controlled operation
+volatile bool fStarted = false; // set when START received from server
+volatile uint32_t last_start_ms = 0;
+volatile uint32_t last_send_ms = 0; // last time we sent our periodic payload
+volatile uint32_t delayed_start_until = 0; // if non-zero, wait until this millis() before first send
+volatile uint32_t start_offset_ms = 0;
+// Debug-print macro: enable when DEBUG is defined
+#ifndef DBG_PRINT
+#ifdef DEBUG
+#define DBG_PRINT(...) printf(__VA_ARGS__)
+#else
+#define DBG_PRINT(...) do{} while(0)
+#endif
+#endif
 // Communication task and queue for client
-typedef struct {
-	uint8_t addr[6];
+typedef struct
+{
 	uint8_t data[256];
 	size_t len;
 } SendItem;
@@ -50,78 +63,147 @@ static QueueHandle_t sendQueue = NULL;
 static TaskHandle_t commTaskHandle = NULL;
 
 // Received data queue and task
-typedef struct {
-	uint8_t mac[6];
+typedef struct
+{
 	uint8_t data[256];
 	int len;
 } RecvItem;
 
 static QueueHandle_t recvQueue = NULL;
 
+// UDP client
+WiFiUDP udp;
+const uint16_t UDP_PORT = 12345;
+#if defined(USE_TCP)
+WiFiServer tcpServer(UDP_PORT);
+#endif
+
 Madgwick madgwick;
 
-#include <esp_now.h>
+Preferences prefs;
 
 // Task to process received items (client)
-void recvTask(void *pvParameters) {
+// forward declare LED array (defined later)
+extern CRGB fastled_leds[];
+void recvTask(void *pvParameters)
+{
 	RecvItem item;
-	for(;;) {
-		if (xQueueReceive(recvQueue, &item, portMAX_DELAY) == pdTRUE) {
-			uint32_t currentTime = millis();
-			// Beacon detection: 2-byte beacon {0xBE,0xAC}
-			if (item.len == 2 && item.data[0] == 0xBE && item.data[1] == 0xAC) {
-				uint32_t interval = (last_beacon_ms == 0) ? 0 : (currentTime - last_beacon_ms);
-				//printf("[CLIENT %d] Interval: %d ms, Seq: %d\n", CLIENT_ID, interval, last_beacon_seq + 1);
-				if (stCalibrate == CALIB_STATE_NONE){
-					stCalibrate = CALIB_STATE_STARTED;
-					gxSum = 0; gySum = 0; gzSum = 0;
-					gxOffset = 0; gyOffset = 0; gzOffset = 0;
-					//printf(" - Calibration started");
+	for (;;)
+	{
+
+#if defined(USE_TCP)
+				// TCP mode: accept incoming TCP connections from server
+				WiFiClient c = tcpServer.available();
+				if (c)
+				{
+					int len = c.read((uint8_t *)item.data, sizeof(item.data));
+					if (len > 0)
+					{
+						item.len = len;
+						uint32_t currentTime = millis();
+						// START detection: 2-byte START {0xAA,0x01}
+						if (item.len == 2 && (uint8_t)item.data[0] == 0xAA && (uint8_t)item.data[1] == 0x01)
+						{
+							fStarted = true;
+							last_start_ms = currentTime;
+							// set start offset based on CLIENT_ID to stagger transmissions
+							start_offset_ms = (uint32_t)((CLIENT_ID > 0) ? (CLIENT_ID - 1) * STAGGER_MS : 0);
+							delayed_start_until = currentTime + start_offset_ms;
+							// reset last_send_ms so first send reports elapsed=0
+							last_send_ms = 0;
+							// LED: START -> blue
+							fastled_leds[0] = CRGB::Blue;
+							FastLED.show();
+							DBG_PRINT("[CLIENT %d] START received\n", CLIENT_ID);
+							continue;
+						}
+						// STOP detection: 2-byte STOP {0xBB,0x00}
+						if (item.len == 2 && (uint8_t)item.data[0] == 0xBB && (uint8_t)item.data[1] == 0x00)
+						{
+							fStarted = false;
+							// clear any pending stagger state
+							delayed_start_until = 0;
+							start_offset_ms = 0;
+							DBG_PRINT("[CLIENT %d] STOP received\n", CLIENT_ID);
+							continue;
+						}
+					}
+					// close the TCP client connection to free socket on both ends
+					c.stop();
 				}
-				bool hasLost = false;
-				if (expected_beacon_seq > 0 && last_beacon_seq + 1 != expected_beacon_seq) {
-					uint32_t lost = (last_beacon_seq + 1) - expected_beacon_seq;
-					printf(" (Lost: %d)", lost);
-					hasLost = true;
+
+#else
+				int packetSize = udp.parsePacket();
+				if (packetSize > 0)
+				{
+					int len = udp.read((char *)item.data, sizeof(item.data));
+					if (len > 0)
+					{
+						item.len = len;
+						uint32_t currentTime = millis();
+						// START detection: 2-byte START {0xAA,0x01}
+						if (item.len == 2 && (uint8_t)item.data[0] == 0xAA && (uint8_t)item.data[1] == 0x01)
+						{
+							fStarted = true;
+							last_start_ms = currentTime;
+							start_offset_ms = (uint32_t)((CLIENT_ID > 0) ? (CLIENT_ID - 1) * STAGGER_MS : 0);
+							delayed_start_until = currentTime + start_offset_ms;
+							last_send_ms = 0;
+							// LED: START -> blue
+							fastled_leds[0] = CRGB(0, 0, 30);
+							FastLED.show();
+							//printf("[CLIENT %d] START received\n", CLIENT_ID);
+							continue;
+						}
+						// STOP detection: 2-byte STOP {0xBB,0x00}
+						if (item.len == 2 && (uint8_t)item.data[0] == 0xBB && (uint8_t)item.data[1] == 0x00)
+						{
+							fStarted = false;
+							// clear any pending stagger state
+							delayed_start_until = 0;
+							start_offset_ms = 0;
+							// LED: STOP -> green
+							fastled_leds[0] = CRGB(0, 30, 0);
+							FastLED.show();
+							DBG_PRINT("[CLIENT %d] STOP received\n", CLIENT_ID);
+							continue;
+						}
+					}
 				}
-				beacon_lost = hasLost;
-				last_beacon_ms = currentTime;
-				last_beacon_seq++;
-				expected_beacon_seq = last_beacon_seq + 1;
-				continue;
-			}
-			/*
-			// Generic data print
-			printf("[%d ms] Received %d bytes from: ", currentTime, item.len);
-			for (int i = 0; i < 6; i++) {
-				printf("%02X", item.mac[i]);
-				if (i < 5) printf(":");
-			}
-			printf(": ");
-			for (int i = 0; i < item.len; i++) printf("%c", item.data[i]);
-			printf("\n");
-			*/
-		}
+#endif
+		vTaskDelay(pdMS_TO_TICKS(10));
 	}
 }
 
-void commTask(void *pvParameters) {
+void commTask(void *pvParameters)
+{
 	SendItem item;
-	for(;;) {
-		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE) {
-			esp_err_t res = esp_now_send(item.addr, item.data, item.len);
-			if (res != ESP_OK) {
-				printf("client commTask: esp_now_send failed %d\n", res);
+	for (;;)
+	{
+		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE)
+		{
+			// send to server via UDP or TCP depending on compile-time flag
+			IPAddress serverIP(192, 168, 4, 1);
+#if defined(USE_TCP)
+			WiFiClient tcp;
+			if (tcp.connect(serverIP, UDP_PORT))
+			{
+				tcp.write(item.data, item.len);
+				tcp.stop();
 			}
+			else
+			{
+				DBG_PRINT("client: TCP connect failed to %s\n", serverIP.toString().c_str());
+			}
+#else
+			udp.beginPacket(serverIP, UDP_PORT);
+			udp.write(item.data, item.len);
+			udp.endPacket();
+#endif
 			vTaskDelay(pdMS_TO_TICKS(1));
 		}
 	}
 }
-
-#include <esp_now.h>
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-char packetBuffer[256];
-int packetCount = 0;
 
 char buf[1024];
 char buf_packet[1024];
@@ -138,25 +220,26 @@ static void initFastLEDFallback()
 	FastLED.addLeds<WS2812B, 35, GRB>(fastled_leds, FALLBACK_NUM_LEDS);
 	FastLED.setBrightness(64);
 	fastled_initialized = true;
-	fastled_leds[0] = CRGB::Green;
+	fastled_leds[0] = CRGB(0, 30, 0);;
 	FastLED.show();
 }
 
 volatile uint8_t fSample = 0;
-// 4msごとにIMU+MadgwickでYaw/Roll/Pitch（1000倍6桁整数×3連結）をバッファし、TDMAスロット進入時に最新から12個分まとめて送信
-char sample_buf[12][20]; // 1バッファ=18文字+1(終端)
+char sample_buf[12][21]; // 1バッファ=20文字+1(終端)
 uint8_t sample_count = 0;
 uint8_t sampleSeq = 0;
 float roll, pitch, yaw;
 
 volatile uint32_t micros0 = 0;
 
-void IRAM_ATTR onTicker() {
+void IRAM_ATTR onTicker()
+{
 	uint8_t buf[20];
 	// BMI270 acc/gyroデータレジスタ: 0x0C～0x1F
-	if (readReg(I2C_ADDR_IMU, BMI270_REG_AUX_DATA, buf, 20)){
+	if (readReg(I2C_ADDR_IMU, BMI270_REG_AUX_DATA, buf, 20))
+	{
 		// Process IMU data
-		axRaw = conv_value(buf[ 9], buf[ 8]);
+		axRaw = conv_value(buf[9], buf[8]);
 		ayRaw = conv_value(buf[11], buf[10]);
 		azRaw = conv_value(buf[13], buf[12]);
 		gxRaw = conv_value(buf[15], buf[14]);
@@ -168,54 +251,30 @@ void IRAM_ATTR onTicker() {
 		gx = (float)gxRaw / 32768.0f * GYRO_MAX_DPS; // [dps]
 		gy = (float)gyRaw / 32768.0f * GYRO_MAX_DPS;
 		gz = (float)gzRaw / 32768.0f * GYRO_MAX_DPS;
-		if (stCalibrate == CALIB_STATE_STARTED) {
-			//printf("calibrating... %d / %d\r", nSampleCalib, N_SAMPLE_CALIB);
+		if (stCalibrate == CALIB_STATE_STARTED)
+		{
+			// printf("calibrating... %d / %d\r", nSampleCalib, N_SAMPLE_CALIB);
 			gxSum += gxRaw;
 			gySum += gyRaw;
 			gzSum += gzRaw;
 			nSampleCalib++;
-			if (nSampleCalib == N_SAMPLE_CALIB){
+			if (nSampleCalib == N_SAMPLE_CALIB)
+			{
 				stCalibrate = CALIB_STATE_DONE;
 				gxOffset = (float)(gxSum / N_SAMPLE_CALIB) / 32768.0f * GYRO_MAX_DPS; // [dps]
-				gyOffset = (float)(gySum / N_SAMPLE_CALIB	) / 32768.0f * GYRO_MAX_DPS; // [dps]
+				gyOffset = (float)(gySum / N_SAMPLE_CALIB) / 32768.0f * GYRO_MAX_DPS; // [dps]
 				gzOffset = (float)(gzSum / N_SAMPLE_CALIB) / 32768.0f * GYRO_MAX_DPS; // [dps]
-				//printf("Calibration done: gxOffset=%.3f, gyOffset=%.3f, gzOffset=%.3f\n", gxOffset, gyOffset, gzOffset);
+				printf("Calibration done: gxOffset=%.3f, gyOffset=%.3f, gzOffset=%.3f\n", gxOffset, gyOffset, gzOffset);
 			}
 		}
 		gx -= gxOffset;
 		gy -= gyOffset;
 		gz -= gzOffset;
-	} else {
-		roll = pitch = yaw = 0.0f;
+	}
+	else
+	{
 	}
 	fSample = 1;
-}
-
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
-{
-	if (status != ESP_NOW_SEND_SUCCESS)
-		printf("Last Packet Send Status = FAILED");
-	//	else
-	//		printf("Last Packet Send Status = SUCCESS");
-}
-
-void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-	// enqueue received data to recvQueue for processing in recvTask
-	if (recvQueue == NULL) return;
-	RecvItem item;
-	memcpy(item.mac, mac, 6);
-	int copyLen = len;
-	if (copyLen > (int)sizeof(item.data)) copyLen = sizeof(item.data);
-	memcpy(item.data, incomingData, copyLen);
-	item.len = copyLen;
-
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	BaseType_t ok = xQueueSendFromISR(recvQueue, &item, &xHigherPriorityTaskWoken);
-	if (ok != pdTRUE) {
-		ok = xQueueSend(recvQueue, &item, 0);
-	}
-	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
 }
 
 void setup()
@@ -239,13 +298,18 @@ void setup()
 	FastLED.show();
 
 	int result;
-	while(IMUinit(I2C_ADDR_IMU) != BMI270_OK) delay(10);
+	while (IMUinit(I2C_ADDR_IMU) != BMI270_OK)
+		delay(10);
 	if (result != BMI270_OK)
 	{
 		while (1)
 		{
-			fastled_leds[0] = CRGB::Red; FastLED.show(); delay(200);
-			fastled_leds[0] = CRGB::Black; FastLED.show(); delay(200);
+			fastled_leds[0] = CRGB::Red;
+			FastLED.show();
+			delay(200);
+			fastled_leds[0] = CRGB::Black;
+			FastLED.show();
+			delay(200);
 		}
 	}
 
@@ -254,95 +318,160 @@ void setup()
 
 	madgwick.begin(SAMPLE_FREQ);
 
-	WiFi.mode(WIFI_MODE_STA);
-	WiFi.channel(1); // チャンネルを固定して通信安定化
-	if (esp_now_init() != ESP_OK)
-	{
-		printf("Error initializing ESP-NOW\n");
-		return;
+	ticker.attach_ms((int)(1000 / SAMPLE_FREQ), onTicker);
+
+	// Check button for calibration
+	prefs.begin("imu_offsets", false); // namespace "imu_offsets", read/write
+	if (M5.BtnA.isPressed()) {
+		// Button pressed: perform calibration
+		DBG_PRINT("[CLIENT %d] Button pressed, starting calibration...\n", CLIENT_ID);
+		stCalibrate = CALIB_STATE_STARTED;
+		gxSum = 0;
+		gySum = 0;
+		gzSum = 0;
+		gxOffset = 0;
+		gyOffset = 0;
+		gzOffset = 0;
+		nSampleCalib = 0;
+		fastled_leds[0] = CRGB(30, 20, 0); // orange, calibrating
+		FastLED.show();
+		// Wait for calibration to complete
+		while (stCalibrate != CALIB_STATE_DONE) {
+			delay(10);
+		}
+		fastled_leds[0] = CRGB::Black; // turn off after calibration
+		FastLED.show();
+		// Save offsets to EEPROM
+		prefs.putFloat("gxOffset", gxOffset);
+		prefs.putFloat("gyOffset", gyOffset);
+		prefs.putFloat("gzOffset", gzOffset);
+		DBG_PRINT("[CLIENT %d] Offsets saved to EEPROM\n", CLIENT_ID);
+	} else {
+		// Button not pressed: load offsets from EEPROM
+		gxOffset = prefs.getFloat("gxOffset", 0.0f);
+		gyOffset = prefs.getFloat("gyOffset", 0.0f);
+		gzOffset = prefs.getFloat("gzOffset", 0.0f);
+		stCalibrate = CALIB_STATE_DONE; // Assume calibration done
+		DBG_PRINT("[CLIENT %d] Offsets loaded from EEPROM: gx=%.3f, gy=%.3f, gz=%.3f\n\n", CLIENT_ID, gxOffset, gyOffset, gzOffset);
 	}
-	esp_now_register_send_cb(onDataSent);
-	esp_now_register_recv_cb(onDataRecv);
-	esp_now_peer_info_t peerInfo = {};
-	memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-	peerInfo.channel = 0;
-	peerInfo.encrypt = false;
-	if (esp_now_add_peer(&peerInfo) != ESP_OK)
-	{
-		printf("Failed to add peer\n");
-		return;
+	prefs.end();
+
+	// for (int i = 0; i < 5; i++){printf("%d\n", i); delay(500);} // wait at boot for serial motnitoring
+
+	// Connect to WiFi AP with static IP (no DHCP)
+	// Server (AP) uses 192.168.4.1 by default — assign client a fixed address following the server
+	// Use last octet = 1 + CLIENT_ID to avoid collisions (CLIENT_ID starts at 1)
+	uint8_t lastOctet = 1 + CLIENT_ID; // e.g. CLIENT_ID=1 -> 192.168.4.2
+	IPAddress localIP(192, 168, 4, lastOctet);
+	IPAddress gateway(192, 168, 4, 1);
+	IPAddress subnet(255, 255, 255, 0);
+	if (!WiFi.config(localIP, gateway, subnet)) {
+		DBG_PRINT("[CLIENT %d] Failed to configure static IP\n", CLIENT_ID);
+	} else {
+		DBG_PRINT("[CLIENT %d] Static IP configured: %s\n", CLIENT_ID, localIP.toString().c_str());
 	}
-	printf("ESP-NOW initialized in STA mode (sending)\nBroadcast peer added\n");
+	WiFi.begin("KAW_Server", "password123");
+	DBG_PRINT("[CLIENT %d] Starting WiFi connection to KAW_Server...\n", CLIENT_ID);
+	// Blink blue while waiting for WiFi to connect (500ms period)
+	bool wifiBlink = false;
+	uint32_t connectStart = millis();
+	uint32_t timeoutMs = 30000; // 30 seconds timeout
+	while (WiFi.status() != WL_CONNECTED) {
+		wifiBlink = !wifiBlink;
+		fastled_leds[0] = wifiBlink ? CRGB::Blue : CRGB::Black;
+		FastLED.show();
+		DBG_PRINT("[CLIENT %d] WiFi status: %d (0=IDLE, 1=NO_SSID, 3=CONNECTED, 4=FAILED, 6=DISCONNECTED)\n", CLIENT_ID, WiFi.status());
+		delay(500);
+		if (millis() - connectStart > timeoutMs) {
+			DBG_PRINT("[CLIENT %d] WiFi connection timeout after %d ms\n", CLIENT_ID, timeoutMs);
+			// Optionally, reset or handle failure
+			break;
+		}
+	}
+	if (WiFi.status() == WL_CONNECTED) {
+		DBG_PRINT("[CLIENT %d] Connected to WiFi, IP=%s, RSSI=%d dBm\n", CLIENT_ID, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+		fastled_leds[0] = CRGB(0, 30, 0);
+		FastLED.show();
+	} else {
+		DBG_PRINT("[CLIENT %d] Failed to connect to WiFi\n", CLIENT_ID);
+		// LED to red or something
+		fastled_leds[0] = CRGB::Red;
+		FastLED.show();
+	}
+
+	// Start network listener depending on transport
+#if defined(USE_TCP)
+	tcpServer.begin();
+	DBG_PRINT("TCP server started on port %d\n", UDP_PORT);
+#else
+	// For UDP, no connection handshake—start UDP listener
+	if (!udp.begin(UDP_PORT))
+	{
+		DBG_PRINT("Failed to start UDP on port %d\n", UDP_PORT);
+		for (;;)
+		{
+			fastled_leds[0] = CRGB::Red;
+			FastLED.show();
+			delay(200);
+			fastled_leds[0] = CRGB::Black;
+			FastLED.show();
+			delay(200);
+		}
+	}
+	else
+	{
+		DBG_PRINT("UDP ready on port %d\n", UDP_PORT);
+	}
+#endif
 	// create send queue and communication task (pinned to core 0)
 	sendQueue = xQueueCreate(8, sizeof(SendItem));
-	if (sendQueue == NULL) {
-		printf("client: Failed to create sendQueue\n");
-	} else {
-		xTaskCreatePinnedToCore(commTask, "CommTask", 4096, NULL, configMAX_PRIORITIES-2, &commTaskHandle, 0);
+	if (sendQueue == NULL)
+	{
+		DBG_PRINT("client: Failed to create sendQueue\n");
+	}
+	else
+	{
+		xTaskCreatePinnedToCore(commTask, "CommTask", 4096, NULL, configMAX_PRIORITIES - 2, &commTaskHandle, 0);
 	}
 	// create receive queue and task
 	recvQueue = xQueueCreate(16, sizeof(RecvItem));
-	if (recvQueue == NULL) {
-		printf("client: Failed to create recvQueue\n");
-	} else {
-		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 0);
+	if (recvQueue == NULL)
+	{
+		DBG_PRINT("client: Failed to create recvQueue\n");
+	}
+	else
+	{
+		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES - 3, NULL, 0);
 	}
 
-	packetCount = 0;
-	memset(packetBuffer, 0, sizeof(packetBuffer));
-	ticker.attach_ms((int)(1000 / SAMPLE_FREQ), onTicker);
 	strcpy(buf_packet, "");
 }
 
 uint16_t n = 0;
-// memo: ESPNOWは256バイトまで
 
 uint32_t lastReceiveTime, currentTime;
-uint8_t stCalibrateLED = CALIB_STATE_NONE;
 
 void loop()
 {
-	// LED制御: ビーコン受信ミスがあれば赤、なければ緑
-	if (beacon_lost) {
-		fastled_leds[0] = CRGB(30, 0, 0); // 赤
-	} else {
-		fastled_leds[0] = CRGB(0, 30, 0); // 緑
-	}
-	FastLED.show();
-
 	fSample = 0;
 	while (fSample == 0)
 		delayMicroseconds(10);
-	if (stCalibrateLED == CALIB_STATE_NONE && stCalibrate == CALIB_STATE_STARTED){
-		fastled_leds[0] = CRGB(30, 10, 0); FastLED.show();
-	}
-	else if (stCalibrateLED == CALIB_STATE_STARTED && stCalibrate == CALIB_STATE_DONE){
-		fastled_leds[0] = CRGB(0, 30, 0); FastLED.show();
-	}
 
-	if (stCalibrate == CALIB_STATE_DONE) {
+	if (stCalibrate == CALIB_STATE_DONE)
+	{
 		madgwick.updateIMU(gx, gy, gz, ax, ay, az);
-		roll = madgwick.getRoll();   // degree
-		pitch = madgwick.getPitch(); // degree
-		yaw = madgwick.getYaw();     // degree
-		// test dummy data
-		//yaw = (float)sampleSeq + 0.123;
-		//roll = (float)sampleSeq + 0.456;
-		//pitch = (float)sampleSeq + 0.789;
-		sampleSeq++;
-		// end of test dummy data
+//		printf("Q: %.3f %.3f %.3f %.3f\n", madgwick.q0, madgwick.q1, madgwick.q2, madgwick.q3);
+//		printf("offset: gx=%.3f, gy=%.3f, gz=%.3f\n", gxOffset, gyOffset, gzOffset);
 	}
-
-	while(roll < 0.0f) roll += 360.0f;
-	while(yaw < 0.0f) yaw += 360.0f;
-	while(pitch < 0.0f) pitch += 360.0f;
 
 	// 1000倍・6桁ゼロ埋め整数化
-	int iroll = (int)roundf(roll * 1000.0f);
-	int ipitch = (int)roundf(pitch * 1000.0f);
-	int iyaw = (int)roundf(yaw * 1000.0f);
-	// 6桁Yaw + 6桁Roll + 6桁Pitch（合計18文字, 先頭0埋め）
-	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%06d%06d%06d", iyaw, iroll, ipitch);
+	int iq0 = (int)roundf(madgwick.q0 * 1000.0f);
+	int iq1 = (int)roundf(madgwick.q1 * 1000.0f);
+	int iq2 = (int)roundf(madgwick.q2 * 1000.0f);
+	int iq3 = (int)roundf(madgwick.q3 * 1000.0f);
+	// 各q(sign+i1桁+f3桁)（合計20文字）
+	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%+05d%+05d%+05d%+05d", iq0, iq1, iq2, iq3);
+//	printf("p[%d]: %s\n", sample_count, sample_buf[sample_count]);
 	// --- Teleplot形式で10サンプルに1回のみ出力 ---
 	/*
 	static int teleplot_counter = 0;
@@ -350,51 +479,54 @@ void loop()
 	if (teleplot_counter >= 10) {
 		teleplot_counter = 0;
 		// Teleplot形式: "teleplot:変数名 値"
-		printf("teleplot:Yaw %.3f\n", yaw);
-		printf("teleplot:Roll %.3f\n", roll);
-		printf("teleplot:Pitch %.3f\n", pitch);
+		DBG_PRINT("teleplot:Yaw %.3f\n", yaw);
+		DBG_PRINT("teleplot:Roll %.3f\n", roll);
+		DBG_PRINT("teleplot:Pitch %.3f\n", pitch);
 //		printf("%d %.3f %.3f %.3f / %.3f %.3f %.3f / %.1f %.1f %.1f\n", millis() % 1000, ax, ay, az, gx, gy, gz, yaw, roll, pitch);
 //		printf("%d %.1f %.1f %.1f\n", millis() % 1000, yaw, roll, pitch);
 //		printf("%s\n", sample_buf[sample_count]);
 	}
 	*/
 	sample_count = (sample_count + 1) % 12;
-	if (last_beacon_ms == 0) return;
-	uint32_t now = millis();
-	uint32_t offset = (now - last_beacon_ms) % TDMA_FRAME_MS;
-	uint32_t my_slot_start = (CLIENT_ID - 1) * TDMA_SLOT_MS;
-	if (offset >= my_slot_start && offset < my_slot_start + TDMA_SLOT_WINDOW_MS) {
-		if (last_sent_beacon_seq != last_beacon_seq) {
-			if (stCalibrate == CALIB_STATE_DONE){
-				char sendbuf[400] = "";
-				sprintf(sendbuf, "%c", '0' + CLIENT_ID);
-				for (int i = 0; i < 12; i++) {
-					int idx = (sample_count + i) % 12;
-					strcat(sendbuf, sample_buf[idx]);
-				}
-				size_t msglen = strlen(sendbuf) + 1;
-				if (msglen > 250) msglen = 250; // ESPNOW最大ペイロード制限
-				if (!esp_now_is_peer_exist(broadcastAddress)) {
-					esp_now_peer_info_t peer = {};
-					memcpy(peer.peer_addr, broadcastAddress, 6);
-					peer.channel = 0;
-					peer.encrypt = false;
-					esp_now_add_peer(&peer);
-				}
-				if (sendQueue != NULL) {
-					SendItem item;
-					memcpy(item.addr, broadcastAddress, 6);
-					memcpy(item.data, sendbuf, msglen);
-					item.len = msglen;
-					if (xQueueSend(sendQueue, &item, pdMS_TO_TICKS(10)) != pdTRUE) {
-						printf("client: sendQueue full - drop packet\n");
-					}
-				} else {
-					if (esp_now_send(broadcastAddress, (uint8_t *)sendbuf, msglen) != ESP_OK)
-						printf("Error sending data\n");
-				}
-				last_sent_beacon_seq = last_beacon_seq;
+	// If not started by SERVER, do nothing
+	if (!fStarted)
+		return;
+	// Send only when 12 samples have been collected (sample_count wrapped to 0)
+	if (stCalibrate == CALIB_STATE_DONE && sample_count == 0)
+	{
+		// If a staggered start is configured, wait until the scheduled time for the first send
+		if (delayed_start_until != 0 && millis() < delayed_start_until)
+		{
+			// not yet time to send for this client
+			return;
+		}
+		char sendbuf[400] = "";
+		sprintf(sendbuf, "%c", '0' + CLIENT_ID);
+		for (int i = 0; i < 12; i++)
+		{
+			int idx = (sample_count + i) % 12;
+			strcat(sendbuf, sample_buf[idx]);
+		}
+		// add newline at end of payload so server can parse lines
+		strcat(sendbuf, "\n");
+		// Log elapsed ms since previous send (0 for first send)
+		unsigned long now_ms = millis();
+		unsigned long elapsed_ms = (last_send_ms == 0) ? 0 : (now_ms - last_send_ms);
+		DBG_PRINT("[CLIENT %d] send elapsed %lu ms\n", CLIENT_ID, elapsed_ms);
+		size_t msglen = strlen(sendbuf) + 1;
+		//printf("len=%d, data=%s", (int)msglen, sendbuf);
+		if (msglen > 250)
+			msglen = 250; // UDP payload limit
+		if (sendQueue != NULL)
+		{
+			SendItem item;
+			memcpy(item.data, sendbuf, msglen);
+			item.len = msglen;
+			if (xQueueSend(sendQueue, &item, pdMS_TO_TICKS(10)) != pdTRUE)
+			{
+				DBG_PRINT("client: sendQueue full - drop packet\n");
 			}
 		}
+		last_send_ms = now_ms;
 	}
 }
