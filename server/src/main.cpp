@@ -35,9 +35,10 @@ typedef struct
 typedef struct
 {
 	char id;
-	float yaw[24];
-	float roll[24];
-	float pitch[24];
+	float q0[24];
+	float q1[24];
+	float q2[24];
+	float q3[24];
 	uint32_t tm;
 	uint8_t fAlternatingError;
 } DisplayItem;
@@ -57,16 +58,18 @@ volatile uint8_t fReceived = 0;
 volatile uint32_t prevReceiveTime = 0;
 volatile char prevClientID = 0;
 
-// データ保持用配列: CLIENT x 12サンプル の yaw, roll, pitch
-float client_yaw[NUM_CLIENTS][12];
-float client_roll[NUM_CLIENTS][12];
-float client_pitch[NUM_CLIENTS][12];
+// データ保持用配列: CLIENT x 12サンプル の q0-q3
+float client_q0[NUM_CLIENTS][12];
+float client_q1[NUM_CLIENTS][12];
+float client_q2[NUM_CLIENTS][12];
+float client_q3[NUM_CLIENTS][12];
 // Per-client payload circular buffer to hold up to 5 recent payloads (each payload = 12 samples)
 #define PAYLOAD_BUFFER_DEPTH 5
 typedef struct {
-	float yaw[12];
-	float roll[12];
-	float pitch[12];
+	float q0[12];
+	float q1[12];
+	float q2[12];
+	float q3[12];
 } PayloadBuf;
 static PayloadBuf payload_buffer[NUM_CLIENTS][PAYLOAD_BUFFER_DEPTH];
 static uint8_t payload_head[NUM_CLIENTS] = {0}; // next write index
@@ -159,32 +162,40 @@ void processReceivedData(RecvItem item)
 	}
 
 	// データパースと格納
+	//printf("received data(%d): %s\n", item.len, item.data);
 	for (uint8_t i = 0; i < 12; i++)
 	{
-		char sample[19];
-		memcpy(sample, &item.data[1 + i * 18], 18);
-		sample[18] = '\0';
-		char yaw_str[7], roll_str[7], pitch_str[7];
-		memcpy(yaw_str, &sample[0], 6);
-		yaw_str[6] = '\0';
-		memcpy(roll_str, &sample[6], 6);
-		roll_str[6] = '\0';
-		memcpy(pitch_str, &sample[12], 6);
-		pitch_str[6] = '\0';
-		int iyaw = atoi(yaw_str);
-		int iroll = atoi(roll_str);
-		int ipitch = atoi(pitch_str);
-		float yaw = iyaw / 1000.0f;
-		float roll = iroll / 1000.0f;
-		float pitch = ipitch / 1000.0f;
+		char sample[21];
+		memcpy(sample, &item.data[1 + i * 20], 20);
+		sample[20] = '\0';
+		char q0_str[8], q1_str[8], q2_str[8], q3_str[8];
+		memcpy(q0_str, &sample[0], 5);
+		q0_str[5] = '\0';
+		memcpy(q1_str, &sample[5], 5);
+		q1_str[5] = '\0';
+		memcpy(q2_str, &sample[10], 5);
+		q2_str[5] = '\0';
+		memcpy(q3_str, &sample[15], 5);
+		q3_str[5] = '\0';
+		int iq0 = atoi(q0_str);
+		int iq1 = atoi(q1_str);
+		int iq2 = atoi(q2_str);
+		int iq3 = atoi(q3_str);
+		float q0 = iq0 / 1000.0f;
+		float q1 = iq1 / 1000.0f;
+		float q2 = iq2 / 1000.0f;
+		float q3 = iq3 / 1000.0f;
 		int client_idx = id - '1'; // '1' -> 0, '2' -> 1
-		client_yaw[client_idx][i] = yaw;
-		client_roll[client_idx][i] = roll;
-		client_pitch[client_idx][i] = pitch;
+		//printf("Client %c Sample %d: q0=%.3f q1=%.3f q2=%.3f q3=%.3f\n", id, i, q0, q1, q2, q3);
+		client_q0[client_idx][i] = q0;
+		client_q1[client_idx][i] = q1;
+		client_q2[client_idx][i] = q2;
+		client_q3[client_idx][i] = q3;
 		// also store into circular payload buffer
-		payload_buffer[client_idx][payload_head[client_idx]].yaw[i] = yaw;
-		payload_buffer[client_idx][payload_head[client_idx]].roll[i] = roll;
-		payload_buffer[client_idx][payload_head[client_idx]].pitch[i] = pitch;
+		payload_buffer[client_idx][payload_head[client_idx]].q0[i] = q0;
+		payload_buffer[client_idx][payload_head[client_idx]].q1[i] = q1;
+		payload_buffer[client_idx][payload_head[client_idx]].q2[i] = q2;
+		payload_buffer[client_idx][payload_head[client_idx]].q3[i] = q3;
 	}
 	// advance circular head and count for this client's payload buffer
 	if (id >= '1' && id <= '0' + NUM_CLIENTS)
@@ -213,9 +224,10 @@ void processReceivedData(RecvItem item)
 				// no data for this client yet: fill zeros
 				for (int i = 0; i < 12; ++i)
 				{
-					dispItem.yaw[c * 12 + i] = 0.0f;
-					dispItem.roll[c * 12 + i] = 0.0f;
-					dispItem.pitch[c * 12 + i] = 0.0f;
+					dispItem.q0[c * 12 + i] = 0.0f;
+					dispItem.q1[c * 12 + i] = 0.0f;
+					dispItem.q2[c * 12 + i] = 0.0f;
+					dispItem.q3[c * 12 + i] = 0.0f;
 				}
 			}
 			else
@@ -223,9 +235,10 @@ void processReceivedData(RecvItem item)
 				int last_idx = (payload_head[c] + PAYLOAD_BUFFER_DEPTH - 1) % PAYLOAD_BUFFER_DEPTH;
 				for (int i = 0; i < 12; ++i)
 				{
-					dispItem.yaw[c * 12 + i] = payload_buffer[c][last_idx].yaw[i];
-					dispItem.roll[c * 12 + i] = payload_buffer[c][last_idx].roll[i];
-					dispItem.pitch[c * 12 + i] = payload_buffer[c][last_idx].pitch[i];
+					dispItem.q0[c * 12 + i] = payload_buffer[c][last_idx].q0[i];
+					dispItem.q1[c * 12 + i] = payload_buffer[c][last_idx].q1[i];
+					dispItem.q2[c * 12 + i] = payload_buffer[c][last_idx].q2[i];
+					dispItem.q3[c * 12 + i] = payload_buffer[c][last_idx].q3[i];
 				}
 			}
 		}
@@ -565,7 +578,7 @@ void loop()
 			{
 				if (!transferEnabled)
 					break;
-				printf(",%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", item.tm / 12, item.roll[i], item.pitch[i], item.yaw[i], item.roll[12 + i], item.pitch[12 + i], item.yaw[12 + i]);
+				printf(",%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", item.tm / 12, item.q0[i], item.q1[i], item.q2[i], item.q3[i], item.q0[12 + i], item.q1[12 + i], item.q2[12 + i], item.q3[12 + i]);
 			}
 		}
 	}

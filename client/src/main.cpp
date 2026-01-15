@@ -4,7 +4,11 @@
 #include <WiFiUdp.h>
 #include <Ticker.h>
 #include <FastLED.h>
+#include <Preferences.h>
 #include "imu.h"
+
+// ToModigy: move q0-q3 in MadgwickAHRS.h from private to pubric
+// memo: q0=scalar, q1,q2,q3=vector
 
 #define CLIENT_ID 1 // 1 or 2
 
@@ -29,8 +33,9 @@ volatile int gxRaw, gyRaw, gzRaw;
 float gxOffset, gyOffset, gzOffset;
 long gxSum, gySum, gzSum;
 //#define N_SAMPLE_CALIB (SAMPLE_FREQ * 1) // 1[s]
-// #define N_SAMPLE_CALIB (SAMPLE_FREQ * 4) // 4[s]
-#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
+//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 4) // 4[s]
+//#define N_SAMPLE_CALIB (SAMPLE_FREQ * 10) // 10[s]
+#define N_SAMPLE_CALIB (SAMPLE_FREQ * 30) // 30[s]
 uint16_t nSampleCalib = 0;
 
 // START-controlled operation
@@ -75,6 +80,8 @@ WiFiServer tcpServer(UDP_PORT);
 
 Madgwick madgwick;
 
+Preferences prefs;
+
 // Task to process received items (client)
 // forward declare LED array (defined later)
 extern CRGB fastled_leds[];
@@ -97,17 +104,6 @@ void recvTask(void *pvParameters)
 						// START detection: 2-byte START {0xAA,0x01}
 						if (item.len == 2 && (uint8_t)item.data[0] == 0xAA && (uint8_t)item.data[1] == 0x01)
 						{
-							if (stCalibrate == CALIB_STATE_NONE)
-							{
-								DBG_PRINT("[CLIENT %d] Starting gyroscope calibration...\n", CLIENT_ID);
-								stCalibrate = CALIB_STATE_STARTED;
-								gxSum = 0;
-								gySum = 0;
-								gzSum = 0;
-								gxOffset = 0;
-								gyOffset = 0;
-								gzOffset = 0;
-							}
 							fStarted = true;
 							last_start_ms = currentTime;
 							// set start offset based on CLIENT_ID to stagger transmissions
@@ -148,17 +144,6 @@ void recvTask(void *pvParameters)
 						// START detection: 2-byte START {0xAA,0x01}
 						if (item.len == 2 && (uint8_t)item.data[0] == 0xAA && (uint8_t)item.data[1] == 0x01)
 						{
-							if (stCalibrate == CALIB_STATE_NONE)
-							{
-								//printf("[CLIENT %d] Starting gyroscope calibration...\n", CLIENT_ID);
-								stCalibrate = CALIB_STATE_STARTED;
-								gxSum = 0;
-								gySum = 0;
-								gzSum = 0;
-								gxOffset = 0;
-								gyOffset = 0;
-								gzOffset = 0;
-							}
 							fStarted = true;
 							last_start_ms = currentTime;
 							start_offset_ms = (uint32_t)((CLIENT_ID > 0) ? (CLIENT_ID - 1) * STAGGER_MS : 0);
@@ -240,8 +225,7 @@ static void initFastLEDFallback()
 }
 
 volatile uint8_t fSample = 0;
-// 4msごとにIMU+MadgwickでYaw/Roll/Pitch（1000倍6桁整数×3連結）をバッファし、TDMAスロット進入時に最新から12個分まとめて送信
-char sample_buf[12][20]; // 1バッファ=18文字+1(終端)
+char sample_buf[12][21]; // 1バッファ=20文字+1(終端)
 uint8_t sample_count = 0;
 uint8_t sampleSeq = 0;
 float roll, pitch, yaw;
@@ -280,7 +264,7 @@ void IRAM_ATTR onTicker()
 				gxOffset = (float)(gxSum / N_SAMPLE_CALIB) / 32768.0f * GYRO_MAX_DPS; // [dps]
 				gyOffset = (float)(gySum / N_SAMPLE_CALIB) / 32768.0f * GYRO_MAX_DPS; // [dps]
 				gzOffset = (float)(gzSum / N_SAMPLE_CALIB) / 32768.0f * GYRO_MAX_DPS; // [dps]
-																																							// printf("Calibration done: gxOffset=%.3f, gyOffset=%.3f, gzOffset=%.3f\n", gxOffset, gyOffset, gzOffset);
+				printf("Calibration done: gxOffset=%.3f, gyOffset=%.3f, gzOffset=%.3f\n", gxOffset, gyOffset, gzOffset);
 			}
 		}
 		gx -= gxOffset;
@@ -289,7 +273,6 @@ void IRAM_ATTR onTicker()
 	}
 	else
 	{
-		roll = pitch = yaw = 0.0f;
 	}
 	fSample = 1;
 }
@@ -335,6 +318,46 @@ void setup()
 
 	madgwick.begin(SAMPLE_FREQ);
 
+	ticker.attach_ms((int)(1000 / SAMPLE_FREQ), onTicker);
+
+	// Check button for calibration
+	prefs.begin("imu_offsets", false); // namespace "imu_offsets", read/write
+	if (M5.BtnA.isPressed()) {
+		// Button pressed: perform calibration
+		DBG_PRINT("[CLIENT %d] Button pressed, starting calibration...\n", CLIENT_ID);
+		stCalibrate = CALIB_STATE_STARTED;
+		gxSum = 0;
+		gySum = 0;
+		gzSum = 0;
+		gxOffset = 0;
+		gyOffset = 0;
+		gzOffset = 0;
+		nSampleCalib = 0;
+		fastled_leds[0] = CRGB(30, 20, 0); // orange, calibrating
+		FastLED.show();
+		// Wait for calibration to complete
+		while (stCalibrate != CALIB_STATE_DONE) {
+			delay(10);
+		}
+		fastled_leds[0] = CRGB::Black; // turn off after calibration
+		FastLED.show();
+		// Save offsets to EEPROM
+		prefs.putFloat("gxOffset", gxOffset);
+		prefs.putFloat("gyOffset", gyOffset);
+		prefs.putFloat("gzOffset", gzOffset);
+		DBG_PRINT("[CLIENT %d] Offsets saved to EEPROM\n", CLIENT_ID);
+	} else {
+		// Button not pressed: load offsets from EEPROM
+		gxOffset = prefs.getFloat("gxOffset", 0.0f);
+		gyOffset = prefs.getFloat("gyOffset", 0.0f);
+		gzOffset = prefs.getFloat("gzOffset", 0.0f);
+		stCalibrate = CALIB_STATE_DONE; // Assume calibration done
+		DBG_PRINT("[CLIENT %d] Offsets loaded from EEPROM: gx=%.3f, gy=%.3f, gz=%.3f\n\n", CLIENT_ID, gxOffset, gyOffset, gzOffset);
+	}
+	prefs.end();
+
+	// for (int i = 0; i < 5; i++){printf("%d\n", i); delay(500);} // wait at boot for serial motnitoring
+
 	// Connect to WiFi AP with static IP (no DHCP)
 	// Server (AP) uses 192.168.4.1 by default — assign client a fixed address following the server
 	// Use last octet = 1 + CLIENT_ID to avoid collisions (CLIENT_ID starts at 1)
@@ -343,20 +366,38 @@ void setup()
 	IPAddress gateway(192, 168, 4, 1);
 	IPAddress subnet(255, 255, 255, 0);
 	if (!WiFi.config(localIP, gateway, subnet)) {
-		DBG_PRINT("Failed to configure static IP\n");
+		DBG_PRINT("[CLIENT %d] Failed to configure static IP\n", CLIENT_ID);
+	} else {
+		DBG_PRINT("[CLIENT %d] Static IP configured: %s\n", CLIENT_ID, localIP.toString().c_str());
 	}
 	WiFi.begin("KAW_Server", "password123");
+	DBG_PRINT("[CLIENT %d] Starting WiFi connection to KAW_Server...\n", CLIENT_ID);
 	// Blink blue while waiting for WiFi to connect (500ms period)
 	bool wifiBlink = false;
+	uint32_t connectStart = millis();
+	uint32_t timeoutMs = 30000; // 30 seconds timeout
 	while (WiFi.status() != WL_CONNECTED) {
 		wifiBlink = !wifiBlink;
 		fastled_leds[0] = wifiBlink ? CRGB::Blue : CRGB::Black;
 		FastLED.show();
+		DBG_PRINT("[CLIENT %d] WiFi status: %d (0=IDLE, 1=NO_SSID, 3=CONNECTED, 4=FAILED, 6=DISCONNECTED)\n", CLIENT_ID, WiFi.status());
 		delay(500);
+		if (millis() - connectStart > timeoutMs) {
+			DBG_PRINT("[CLIENT %d] WiFi connection timeout after %d ms\n", CLIENT_ID, timeoutMs);
+			// Optionally, reset or handle failure
+			break;
+		}
 	}
-	DBG_PRINT("Connected to WiFi, IP=%s\n", WiFi.localIP().toString().c_str());
-	fastled_leds[0] = CRGB(0, 30, 0);
-	FastLED.show();
+	if (WiFi.status() == WL_CONNECTED) {
+		DBG_PRINT("[CLIENT %d] Connected to WiFi, IP=%s, RSSI=%d dBm\n", CLIENT_ID, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+		fastled_leds[0] = CRGB(0, 30, 0);
+		FastLED.show();
+	} else {
+		DBG_PRINT("[CLIENT %d] Failed to connect to WiFi\n", CLIENT_ID);
+		// LED to red or something
+		fastled_leds[0] = CRGB::Red;
+		FastLED.show();
+	}
 
 	// Start network listener depending on transport
 #if defined(USE_TCP)
@@ -403,58 +444,34 @@ void setup()
 		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES - 3, NULL, 0);
 	}
 
-	ticker.attach_ms((int)(1000 / SAMPLE_FREQ), onTicker);
 	strcpy(buf_packet, "");
 }
 
 uint16_t n = 0;
 
 uint32_t lastReceiveTime, currentTime;
-uint8_t stCalibrateLED = CALIB_STATE_NONE;
 
 void loop()
 {
 	fSample = 0;
 	while (fSample == 0)
 		delayMicroseconds(10);
-	if (stCalibrateLED == CALIB_STATE_NONE && stCalibrate == CALIB_STATE_STARTED)
-	{
-		fastled_leds[0] = CRGB(30, 20, 0); // orange, calibrating
-		FastLED.show();
-	}
-	else if (stCalibrateLED == CALIB_STATE_STARTED && stCalibrate == CALIB_STATE_DONE)
-	{
-		fastled_leds[0] = CRGB(30, 0, 0); // blue, transfering
-		FastLED.show();
-	}
 
 	if (stCalibrate == CALIB_STATE_DONE)
 	{
 		madgwick.updateIMU(gx, gy, gz, ax, ay, az);
-		roll = madgwick.getRoll();	 // degree
-		pitch = madgwick.getPitch(); // degree
-		yaw = madgwick.getYaw();		 // degree
-		// test dummy data
-		//yaw = (float)sampleSeq + 0.123;
-		//roll = (float)sampleSeq + 0.456;
-		//pitch = (float)sampleSeq + 0.789;
-		sampleSeq++;
-		// end of test dummy data
+//		printf("Q: %.3f %.3f %.3f %.3f\n", madgwick.q0, madgwick.q1, madgwick.q2, madgwick.q3);
+//		printf("offset: gx=%.3f, gy=%.3f, gz=%.3f\n", gxOffset, gyOffset, gzOffset);
 	}
 
-	while (roll < 0.0f)
-		roll += 360.0f;
-	while (yaw < 0.0f)
-		yaw += 360.0f;
-	while (pitch < 0.0f)
-		pitch += 360.0f;
-
 	// 1000倍・6桁ゼロ埋め整数化
-	int iroll = (int)roundf(roll * 1000.0f);
-	int ipitch = (int)roundf(pitch * 1000.0f);
-	int iyaw = (int)roundf(yaw * 1000.0f);
-	// 6桁Yaw + 6桁Roll + 6桁Pitch（合計18文字, 先頭0埋め）
-	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%06d%06d%06d", iyaw, iroll, ipitch);
+	int iq0 = (int)roundf(madgwick.q0 * 1000.0f);
+	int iq1 = (int)roundf(madgwick.q1 * 1000.0f);
+	int iq2 = (int)roundf(madgwick.q2 * 1000.0f);
+	int iq3 = (int)roundf(madgwick.q3 * 1000.0f);
+	// 各q(sign+i1桁+f3桁)（合計20文字）
+	snprintf(sample_buf[sample_count], sizeof(sample_buf[0]), "%+05d%+05d%+05d%+05d", iq0, iq1, iq2, iq3);
+//	printf("p[%d]: %s\n", sample_count, sample_buf[sample_count]);
 	// --- Teleplot形式で10サンプルに1回のみ出力 ---
 	/*
 	static int teleplot_counter = 0;
@@ -497,6 +514,7 @@ void loop()
 		unsigned long elapsed_ms = (last_send_ms == 0) ? 0 : (now_ms - last_send_ms);
 		DBG_PRINT("[CLIENT %d] send elapsed %lu ms\n", CLIENT_ID, elapsed_ms);
 		size_t msglen = strlen(sendbuf) + 1;
+		//printf("len=%d, data=%s", (int)msglen, sendbuf);
 		if (msglen > 250)
 			msglen = 250; // UDP payload limit
 		if (sendQueue != NULL)

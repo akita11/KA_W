@@ -84,7 +84,7 @@ int IMUinit(uint8_t i2c_addr)
 	uint8_t addr_array[2] = {(uint8_t)((index >> 1) & 0x0F), (uint8_t)(index >> 5)};
 
 	// IMU init sequence
-	printf("CHIP_ID : %02x\n", readRegB(i2c_addr, 0x00)); // CHIP_ID = 0x24
+	//printf("CHIP_ID : %02x\n", readRegB(i2c_addr, 0x00)); // CHIP_ID = 0x24
 	if (!writeRegB(i2c_addr, BMI270_REG_PWR_CONF, BMI270_PWR_CONF_ADV_OFF))
 	{ // disable adv.power save
 		return BMI270_ERR_WRITE_FAILED;
