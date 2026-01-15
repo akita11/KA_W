@@ -1,29 +1,44 @@
 // KA_W Server
 // Configuration
-// PC--[USB]--KAW[S] <---[ESPNow]--> KAW[C]
+// KA_W Server
+// Configuration
+// PC--[USB]--KAW[S] <---[TCP]--> KAW[C]
 
 #define NUM_CLIENTS 2
 
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <Ticker.h>
-// FastLED for AtomS3 Lite onboard LED
 #include <FastLED.h>
-#include <esp_now.h>
+
+//#define DEBUG
+
+// Debug-print macro: enable when DEBUG is defined
+#ifndef DBG_PRINT
+#ifdef DEBUG
+#define DBG_PRINT(...) printf(__VA_ARGS__)
+#else
+#define DBG_PRINT(...) do{} while(0)
+#endif
+#endif
+
+//#define USE_TCP
 
 // Received data queue and task
-typedef struct {
-	uint8_t mac[6];
+typedef struct
+{
+	char clientID;
 	uint8_t data[256];
 	int len;
 } RecvItem;
 
-typedef struct {
+typedef struct
+{
 	char id;
-	float yaw[24];
-	float roll[24];
-	float pitch[24];
+	float q0[24];
+	float q1[24];
+	float q2[24];
+	float q3[24];
 	uint32_t tm;
 	uint8_t fAlternatingError;
 } DisplayItem;
@@ -31,22 +46,34 @@ typedef struct {
 static QueueHandle_t recvQueue = NULL;
 static QueueHandle_t displayQueue = NULL;
 
-// Forward declarations for variables used in recvTask
-extern uint32_t lastReceiveTime;
-extern uint32_t previousThroughputSamplingTime;
-extern uint16_t nThroughputSamples;
+// Track per-client connection (set when data received from client)
+static bool client_connected[NUM_CLIENTS] = {0};
+
+// Throughput sample count
 #define SERVER_THROUGHPUT_SAMPLE 100
 
-volatile uint8_t beaconEnabled = 0; // STARTで1, STOPで0
+volatile uint8_t transferEnabled = 0; // STARTで1, STOPで0
 
 volatile uint8_t fReceived = 0;
 volatile uint32_t prevReceiveTime = 0;
 volatile char prevClientID = 0;
 
-// データ保持用配列: CLIENT x 12サンプル の yaw, roll, pitch
-float client_yaw[NUM_CLIENTS][12];
-float client_roll[NUM_CLIENTS][12];
-float client_pitch[NUM_CLIENTS][12];
+// データ保持用配列: CLIENT x 12サンプル の q0-q3
+float client_q0[NUM_CLIENTS][12];
+float client_q1[NUM_CLIENTS][12];
+float client_q2[NUM_CLIENTS][12];
+float client_q3[NUM_CLIENTS][12];
+// Per-client payload circular buffer to hold up to 5 recent payloads (each payload = 12 samples)
+#define PAYLOAD_BUFFER_DEPTH 5
+typedef struct {
+	float q0[12];
+	float q1[12];
+	float q2[12];
+	float q3[12];
+} PayloadBuf;
+static PayloadBuf payload_buffer[NUM_CLIENTS][PAYLOAD_BUFFER_DEPTH];
+static uint8_t payload_head[NUM_CLIENTS] = {0}; // next write index
+static uint8_t payload_count[NUM_CLIENTS] = {0}; // number of stored payloads (<=DEPTH)
 volatile uint32_t lastDisplayTime = 0;
 
 // FastLED fallback
@@ -55,157 +82,255 @@ static CRGB fastled_leds[FALLBACK_NUM_LEDS];
 static bool fastled_initialized = false;
 static int fastled_pin = -1;
 
-// Callback function for when data is received - enqueue and return quickly
-void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-	if (recvQueue == NULL) return;
-	RecvItem item;
-	memcpy(item.mac, mac, 6);
-	int copyLen = len;
-	if (copyLen > (int)sizeof(item.data)) copyLen = sizeof(item.data);
-	memcpy(item.data, incomingData, copyLen);
-	item.len = copyLen;
+// UDP
+WiFiUDP udp;
+const uint16_t UDP_PORT = 12345;
 
-	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-	// try FromISR first (fast and safe if called in ISR-like context)
-	BaseType_t ok = xQueueSendFromISR(recvQueue, &item, &xHigherPriorityTaskWoken);
-	if (ok != pdTRUE) {
-		// fallback to non-ISR enqueue (non-blocking)
-		ok = xQueueSend(recvQueue, &item, 0);
-	}
-	if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
-}
+#define START0 0xAA
+#define START1 0x01
+#define STOP0 0xBB
+#define STOP1 0x00
+
+// forward declaration
+static void printAndResetIntervalAverages();
+
+#if defined(USE_TCP)
+WiFiServer tcpServer(UDP_PORT);
+#endif
 
 uint8_t nShowDebug = 0;
 uint32_t sampleSeq = 0;
-
 uint32_t t0 = 0;
-
 uint8_t fAlternatingReceiveError = 0;
+uint32_t lastReceiveTime = 0; // Track last receive time for SERVER
+uint16_t nThroughputSamples = 0;
+uint32_t previousThroughputSamplingTime = 0;
+// per-client last receive timestamp (ms)
+static uint32_t last_recv_ms[NUM_CLIENTS] = {0};
+// per-client interval accumulators (sum of intervals in ms and count)
+static uint64_t sum_intervals_ms[NUM_CLIENTS] = {0};
+static uint32_t count_intervals[NUM_CLIENTS] = {0};
 
-// Task to process received items
-void recvTask(void *pvParameters) {
-	RecvItem item;
-	for (;;) {
-		if (xQueueReceive(recvQueue, &item, portMAX_DELAY) == pdTRUE) {
-			uint32_t currentTime = millis();
+void processReceivedData(RecvItem item)
+{
+	uint32_t currentTime = millis();
+	// per-client elapsed will be computed below
+	// 受信元クライアントIDを先に表示してからペイロード内容を表示
+	char srcId = (item.len > 0) ? (char)item.data[0] : '?';
+	// print only elapsed ms per-client (computed after determining client index)
+	// placeholder message; exact elapsed printed below when client index known
 /*
-			nShowDebug++;
-			if (nShowDebug < 2){
-			// データ受信時に内容とmillis()を表示
-				printf("[SERVER] Data received at %lu ms: %d bytes\n", (unsigned long)currentTime, item.len);
-				for (int i = 0; i < item.len; i++) {
-					char c = item.data[i];
-					if (c >= 32 && c <= 126) putchar(c); else putchar('.');
-				}
-				putchar('\n');
-			}
-			nShowDebug = (nShowDebug + 1) % 24;
-*/
-			//printf("%d %c\n", currentTime - lastReceiveTime, item.data[0]);
-			//printf("%s\n", item.data);
-			char id = item.data[0];
-			// 交互受信チェック
-			if (prevClientID != 0 && ((prevClientID == '1' && id != '2') || (prevClientID == '2' && id != '1'))) {
-				fAlternatingReceiveError = 1;
-				//printf("Error: Expected CLIENT %c but received %c\n", (prevClientID == '1') ? '2' : '1', id);
-				//fastled_leds[0] = CRGB(30, 0, 0); // 赤
-				//FastLED.show();
-			}
-			else fAlternatingReceiveError = 0;
-			prevClientID = id;
-			// データパースと格納
-			for (uint8_t i = 0; i < 12; i++){
-				char sample[19];
-				memcpy(sample, &item.data[1 + i * 18], 18);
-				sample[18] = '\0';
-				char yaw_str[7], roll_str[7], pitch_str[7];
-				memcpy(yaw_str, &sample[0], 6); yaw_str[6] = '\0';
-				memcpy(roll_str, &sample[6], 6); roll_str[6] = '\0';
-				memcpy(pitch_str, &sample[12], 6); pitch_str[6] = '\0';
-				int iyaw = atoi(yaw_str);
-				int iroll = atoi(roll_str);
-				int ipitch = atoi(pitch_str);
-				float yaw = iyaw / 1000.0f;
-				float roll = iroll / 1000.0f;
-				float pitch = ipitch / 1000.0f;
-				int client_idx = id - '1'; // '1' -> 0, '2' -> 1
-				client_yaw[client_idx][i] = yaw;
-				client_roll[client_idx][i] = roll;
-				client_pitch[client_idx][i] = pitch;
-			}
-			// CLIENT=2受信後に全データ表示
-			if (id == '2' && beaconEnabled) {
-				uint32_t now = millis();
-				uint32_t elapsed = (lastDisplayTime == 0) ? 0 : (now - lastDisplayTime);
-				//printf("Elapsed: %d ms\n", elapsed);
-				uint32_t t1 = micros();
-				uint32_t tm = t1 - t0;
-				t0 = t1;
-				char cAlternatingError = fAlternatingReceiveError ? '*' : ' ';
-				DisplayItem dispItem;
-				dispItem.id = id;
-				dispItem.tm = tm;
-				dispItem.fAlternatingError = fAlternatingReceiveError;
-				for (int c = 0; c < NUM_CLIENTS; c++) {
-					for (int i = 0; i < 12; i++) {
-						dispItem.yaw[c*12 + i] = client_yaw[c][i];
-						dispItem.roll[c*12 + i] = client_roll[c][i];
-						dispItem.pitch[c*12 + i] = client_pitch[c][i];
-					}
-				}
-				xQueueSend(displayQueue, &dispItem, 0);
-				lastDisplayTime = now;
-			}				
-			lastReceiveTime = currentTime;
-			fReceived = (fReceived + 1) % 10;
-			uint32_t interval = (prevReceiveTime == 0) ? 0 : (currentTime - prevReceiveTime);
-			uint8_t clientID = item.data[0] - '0';
-			//printf("Received %d bytes from %d Interval: %lu ms\n", item.len, clientID, (unsigned long)interval);
-			// 受信間隔エラーをLED表示
-/*
-			if (interval > 40) { // 受信間隔が24msよりも大幅に長い場合
-				if (fReceived < 5) {
-					fastled_leds[0] = CRGB(30, 0, 30); // 赤紫
-				} else {
-					fastled_leds[0] = CRGB(30, 0, 0); // 赤
-				}
-			} else {
-				if (fReceived < 5) {
-					fastled_leds[0] = CRGB(0, 0, 30); // 青
-				} else {
-					fastled_leds[0] = CRGB(30, 30, 0); // 黄
-				}
-			}
-			FastLED.show();
-*/
-			// スループット計算
-/*
-			prevReceiveTime = currentTime;
-			nThroughputSamples++;
-			if (nThroughputSamples == SERVER_THROUGHPUT_SAMPLE) {
-				uint32_t timeSinceLast = (previousThroughputSamplingTime == 0) ? 0 : (currentTime - previousThroughputSamplingTime);
-				float avgTime = (float)timeSinceLast / (float)SERVER_THROUGHPUT_SAMPLE;
-				nThroughputSamples = 0;
-				//printf("Average interval: %.2f ms / %d - %d\n", avgTime, currentTime, previousThroughputSamplingTime);
-				previousThroughputSamplingTime = currentTime;
-			}
-*/
+		for (int i = 0; i < item.len; i++)
+		{
+			char c = item.data[i];
+			if (c >= 32 && c <= 126)
+				putchar(c);
+			else
+				putchar('.');
 		}
+		putchar('\n');
+*/
+
+	char id = (item.len > 0) ? item.data[0] : '?';
+	// mark client as seen/connected and compute per-client elapsed
+	if (id >= '1' && id <= '0' + NUM_CLIENTS)
+	{
+		int cidx = id - '1';
+		if (!client_connected[cidx])
+		{
+			client_connected[cidx] = true;
+			DBG_PRINT("[SERVER] CLIENT %c marked connected\n", id);
+			// If all clients are now connected, set LED to green immediately
+			bool allConn = true;
+			for (int _i = 0; _i < NUM_CLIENTS; ++_i) if (!client_connected[_i]) { allConn = false; break; }
+			if (allConn)
+			{
+				fastled_leds[0] = CRGB(0, 30, 0);
+				FastLED.show();
+			}
+		}
+		// compute per-client elapsed ms since previous receive
+		uint32_t elapsed_client_ms = (last_recv_ms[cidx] == 0) ? 0 : (currentTime - last_recv_ms[cidx]);
+		//printf("[SERVER] CLIENT %c elapsed %lu ms since previous receive, %d bytes\n", id, (unsigned long)elapsed_client_ms, item.len);
+		// accumulate interval only when transfer is active (between START and STOP)
+		if (transferEnabled && last_recv_ms[cidx] != 0)
+		{
+			sum_intervals_ms[cidx] += (uint64_t)elapsed_client_ms;
+			count_intervals[cidx]++;
+		}
+		last_recv_ms[cidx] = currentTime;
+	}
+
+	// データパースと格納
+	//printf("received data(%d): %s\n", item.len, item.data);
+	for (uint8_t i = 0; i < 12; i++)
+	{
+		char sample[21];
+		memcpy(sample, &item.data[1 + i * 20], 20);
+		sample[20] = '\0';
+		char q0_str[8], q1_str[8], q2_str[8], q3_str[8];
+		memcpy(q0_str, &sample[0], 5);
+		q0_str[5] = '\0';
+		memcpy(q1_str, &sample[5], 5);
+		q1_str[5] = '\0';
+		memcpy(q2_str, &sample[10], 5);
+		q2_str[5] = '\0';
+		memcpy(q3_str, &sample[15], 5);
+		q3_str[5] = '\0';
+		int iq0 = atoi(q0_str);
+		int iq1 = atoi(q1_str);
+		int iq2 = atoi(q2_str);
+		int iq3 = atoi(q3_str);
+		float q0 = iq0 / 1000.0f;
+		float q1 = iq1 / 1000.0f;
+		float q2 = iq2 / 1000.0f;
+		float q3 = iq3 / 1000.0f;
+		int client_idx = id - '1'; // '1' -> 0, '2' -> 1
+		//printf("Client %c Sample %d: q0=%.3f q1=%.3f q2=%.3f q3=%.3f\n", id, i, q0, q1, q2, q3);
+		client_q0[client_idx][i] = q0;
+		client_q1[client_idx][i] = q1;
+		client_q2[client_idx][i] = q2;
+		client_q3[client_idx][i] = q3;
+		// also store into circular payload buffer
+		payload_buffer[client_idx][payload_head[client_idx]].q0[i] = q0;
+		payload_buffer[client_idx][payload_head[client_idx]].q1[i] = q1;
+		payload_buffer[client_idx][payload_head[client_idx]].q2[i] = q2;
+		payload_buffer[client_idx][payload_head[client_idx]].q3[i] = q3;
+	}
+	// advance circular head and count for this client's payload buffer
+	if (id >= '1' && id <= '0' + NUM_CLIENTS)
+	{
+		int cidx = id - '1';
+		payload_head[cidx] = (payload_head[cidx] + 1) % PAYLOAD_BUFFER_DEPTH;
+		if (payload_count[cidx] < PAYLOAD_BUFFER_DEPTH) payload_count[cidx]++;
+	}
+	// (displaying combined payloads is handled below using per-client block buffers)
+	lastReceiveTime = currentTime;
+	prevReceiveTime = currentTime;
+	fReceived = (fReceived + 1) % 10;
+
+	// If this is CLIENT '2' and transfer is enabled, prepare a combined display item
+	if (id == '2' && transferEnabled)
+	{
+		DisplayItem dispItem;
+		dispItem.id = id;
+		dispItem.tm = 0;
+		dispItem.fAlternatingError = fAlternatingReceiveError;
+		// Determine latest payload index for each client
+		for (int c = 0; c < NUM_CLIENTS; ++c)
+		{
+			if (payload_count[c] == 0)
+			{
+				// no data for this client yet: fill zeros
+				for (int i = 0; i < 12; ++i)
+				{
+					dispItem.q0[c * 12 + i] = 0.0f;
+					dispItem.q1[c * 12 + i] = 0.0f;
+					dispItem.q2[c * 12 + i] = 0.0f;
+					dispItem.q3[c * 12 + i] = 0.0f;
+				}
+			}
+			else
+			{
+				int last_idx = (payload_head[c] + PAYLOAD_BUFFER_DEPTH - 1) % PAYLOAD_BUFFER_DEPTH;
+				for (int i = 0; i < 12; ++i)
+				{
+					dispItem.q0[c * 12 + i] = payload_buffer[c][last_idx].q0[i];
+					dispItem.q1[c * 12 + i] = payload_buffer[c][last_idx].q1[i];
+					dispItem.q2[c * 12 + i] = payload_buffer[c][last_idx].q2[i];
+					dispItem.q3[c * 12 + i] = payload_buffer[c][last_idx].q3[i];
+				}
+			}
+		}
+		// compute tm using micros() delta as before
+		uint32_t t1 = micros();
+		dispItem.tm = (t0 == 0) ? 0 : (t1 - t0);
+		t0 = t1;
+		// enqueue for display
+		xQueueSend(displayQueue, &dispItem, 0);
+		lastDisplayTime = currentTime;
+	}
+
+	// スループット計算（オプション）
+	// prevReceiveTime = currentTime;
+	// nThroughputSamples++;
+	// if (nThroughputSamples == SERVER_THROUGHPUT_SAMPLE) { ... }
+}
+
+// Print per-client average receive interval (ms) for the last START..STOP session and reset accumulators
+static void printAndResetIntervalAverages()
+{
+	DBG_PRINT("[SERVER] Per-client average receive interval (ms) for last session:\n");
+	printf("#");
+	for (int i = 0; i < NUM_CLIENTS; ++i)
+	{
+		if (count_intervals[i] == 0)
+		{
+			printf("%d,0,-,", i + 1);
+		}
+		else
+		{
+			double avg = (double)sum_intervals_ms[i] / (double)count_intervals[i];
+			printf("%d,%.2f,%u,", i + 1, avg, count_intervals[i]);
+		}
+		// reset accumulators and last receive time for next session
+		sum_intervals_ms[i] = 0;
+		count_intervals[i] = 0;
+		last_recv_ms[i] = 0;
+	}
+	printf("\n");
+}
+
+void recvTask(void *pvParameters)
+{
+	RecvItem item;
+	for (;;)
+	{
+		// Support both UDP and TCP server modes
+#if defined(USE_TCP)
+		WiFiClient c = tcpServer.available();
+		if (c)
+		{
+			int len = c.read((uint8_t *)item.data, sizeof(item.data));
+			if (len > 0)
+			{
+				item.len = len;
+				// If this is a STOP control (maybe received via UDP/TCP loopback), print averages and reset
+				if (item.len == 2 && (uint8_t)item.data[0] == STOP0 && (uint8_t)item.data[1] == STOP1)
+				{
+					transferEnabled = 0;
+					printAndResetIntervalAverages();
+				}
+				processReceivedData(item);
+			}
+		}
+#else
+		int packetSize = udp.parsePacket();
+		if (packetSize > 0)
+		{
+			int len = udp.read((char *)item.data, sizeof(item.data));
+			if (len > 0)
+			{
+				item.len = len;
+				// If this is a STOP control (server may receive its own broadcast), print averages and reset
+				if (item.len == 2 && (uint8_t)item.data[0] == STOP0 && (uint8_t)item.data[1] == STOP1)
+				{
+					transferEnabled = 0;
+					printAndResetIntervalAverages();
+				}
+				processReceivedData(item);
+			}
+		}
+#endif
+		vTaskDelay(pdMS_TO_TICKS(10)); // Small delay
 	}
 }
 
 #define SAMPLE_FREQ 250
 
-// TDMA parameters
-#define TDMA_FRAME_MS 48	// Frame period in milliseconds (12サンプル x 4ms)
-#define TDMA_BEACON0 0    // beacon payload first byte marker
-#define TDMA_BEACON1 1    // beacon payload second byte marker
-Ticker beaconTicker;
-
 // Communication task and queue
-typedef struct {
-	uint8_t addr[6];
+typedef struct
+{
 	uint8_t data[32];
 	size_t len;
 } SendItem;
@@ -213,32 +338,84 @@ typedef struct {
 static QueueHandle_t sendQueue = NULL;
 static TaskHandle_t commTaskHandle = NULL;
 
-void commTask(void *pvParameters) {
+void commTask(void *pvParameters)
+{
 	SendItem item;
-	vTaskDelay(pdMS_TO_TICKS(500)); // Wait for WiFi/ESP-NOW to fully initialize
-	for(;;) {
-		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE) {
+	vTaskDelay(pdMS_TO_TICKS(500)); // Wait for WiFi/TCP to fully initialize
+	for (;;)
+	{
+		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE)
+		{
 			vTaskDelay(pdMS_TO_TICKS(2)); // Small delay before send
-			esp_err_t res = esp_now_send(item.addr, item.data, item.len);
-			if (res != ESP_OK) {
-				printf("commTask: esp_now_send failed %d\n", res);
+#if defined(USE_TCP)
+			// In TCP mode, send the queued payload to each client individually
+			for (int c = 0; c < NUM_CLIENTS; ++c)
+			{
+				IPAddress clientIP(192, 168, 4, c + 2);
+				WiFiClient tcp;
+				if (tcp.connect(clientIP, UDP_PORT))
+				{
+					tcp.write(item.data, item.len);
+					tcp.stop();
+				}
+				else
+				{
+					DBG_PRINT("[SERVER] commTask: TCP connect failed to %s\n", clientIP.toString().c_str());
+				}
+				vTaskDelay(pdMS_TO_TICKS(2));
 			}
+#else
+			// Default behavior: send queued item as UDP broadcast
+			IPAddress bc(192, 168, 4, 255);
+			udp.beginPacket(bc, UDP_PORT);
+			udp.write(item.data, item.len);
+			udp.endPacket();
+#endif
 		}
 	}
 }
 
-// ESP-NOW configuration
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Broadcast address
-char packetBuffer[256];																						 // Buffer to accumulate packets
-int packetCount = 0;																							 // Current number of packets in buffer
-
-//char buf[1025];
-
-uint32_t lastReceiveTime = 0; // Track last receive time for SERVER
-// Throughput measurement (server)
-#define SERVER_THROUGHPUT_SAMPLE 100
-uint16_t nThroughputSamples = 0;
-uint32_t previousThroughputSamplingTime = 0;
+// Send control (START/STOP) to a specific client IP (repeat logic executed by caller)
+static void sendControlToClient(int client_idx, bool isStart)
+{
+	IPAddress clientIP(192, 168, 4, client_idx + 2); // client_idx 0 -> .2
+	uint8_t msg[2];
+	msg[0] = isStart ? START0 : STOP0;
+	msg[1] = isStart ? START1 : STOP1;
+#if defined(USE_TCP)
+	WiFiClient tcp;
+	if (tcp.connect(clientIP, UDP_PORT))
+	{
+		tcp.write(msg, 2);
+		tcp.stop();
+		// Mark this client as connected when TCP connect succeeds
+		if (client_idx >= 0 && client_idx < NUM_CLIENTS)
+		{
+				if (!client_connected[client_idx])
+				{
+					client_connected[client_idx] = true;
+					DBG_PRINT("[SERVER] CLIENT %d marked connected (via TCP connect)\n", client_idx + 1);
+				// If all clients are now connected, set LED to green immediately
+				bool allConn = true;
+				for (int _i = 0; _i < NUM_CLIENTS; ++_i) if (!client_connected[_i]) { allConn = false; break; }
+				if (allConn)
+				{
+					fastled_leds[0] = CRGB(0, 30, 0);
+					FastLED.show();
+				}
+			}
+		}
+	}
+	else
+	{
+		DBG_PRINT("[SERVER] TCP connect failed to %s\n", clientIP.toString().c_str());
+	}
+#else
+	udp.beginPacket(clientIP, UDP_PORT);
+	udp.write(msg, 2);
+	udp.endPacket();
+#endif
+}
 
 static void initFastLEDFallback()
 {
@@ -253,17 +430,7 @@ static void initFastLEDFallback()
 	FastLED.show();
 }
 
-// Callback function for when data is sent
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
-{
-	if (status != ESP_NOW_SEND_SUCCESS)
-	{
-		printf("Last Packet Send Status = FAILED");
-	}
-//	else printf("Last Packet Send Status = SUCCESS");
-}
-
-uint32_t lastBeaconSentTime = 0;
+// beacon ticker and periodic beaconing removed; server uses START/STOP control
 
 void setup()
 {
@@ -276,108 +443,145 @@ void setup()
 	fastled_leds[0] = CRGB(0, 30, 0);
 	FastLED.show();
 
-	// Initialize ESP-NOW in STA mode (simpler, avoids AP overhead)
-	WiFi.mode(WIFI_MODE_STA);
-	WiFi.channel(1); // チャンネルを固定して通信安定化
-	vTaskDelay(pdMS_TO_TICKS(100));
-	if (esp_now_init() != ESP_OK)
+	// Initialize WiFi in AP mode for TCP server
+	WiFi.mode(WIFI_AP);
+	WiFi.softAP("KAW_Server", "password123"); // SSID and password
+	IPAddress IP = WiFi.softAPIP();
+	DBG_PRINT("AP IP address: %s\n", IP.toString().c_str());
+
+	// Wait for all clients to connect to the AP before proceeding
+	// Indicate waiting with orange LED
+	fastled_leds[0] = CRGB(30, 15, 0); // orange
+	FastLED.show();
+	while (WiFi.softAPgetStationNum() < NUM_CLIENTS)
 	{
-		printf("Error initializing ESP-NOW\n");
-		return;
+		// brief delay while waiting
+		delay(200);
 	}
-	// Register receive callback
-	esp_now_register_recv_cb(onDataRecv);
-	// Register send callback so we can observe send results on server as well
-	esp_now_register_send_cb(onDataSent);
-	// Register broadcast peer explicitly before starting beacon
-	if (!esp_now_is_peer_exist(broadcastAddress)) {
-		esp_now_peer_info_t peer = {};
-		memcpy(peer.peer_addr, broadcastAddress, 6);
-		peer.channel = 0;
-		peer.encrypt = false;
-		esp_now_add_peer(&peer);
-	}
-	printf("ESP-NOW initialized in STA mode (receiving)\n");
-	vTaskDelay(pdMS_TO_TICKS(100)); // Small delay after ESP-NOW init
+	// all clients are connected -> set green
+	fastled_leds[0] = CRGB(0, 30, 0);
+	FastLED.show();
+
+	// Start UDP listener
+	// Start network listener depending on transport
+#if defined(USE_TCP)
+		tcpServer.begin();
+		DBG_PRINT("TCP server started on port %d\n", UDP_PORT);
+#else
+		if (!udp.begin(UDP_PORT))
+		{
+			DBG_PRINT("Failed to start UDP on port %d\n", UDP_PORT);
+		}
+		else
+		{
+			DBG_PRINT("UDP server started on port %d\n", UDP_PORT);
+		}
+#endif
+	vTaskDelay(pdMS_TO_TICKS(100));
+
 	// create send queue and communication task (pinned to core 0)
 	sendQueue = xQueueCreate(10, sizeof(SendItem));
-	if (sendQueue == NULL) {
-		printf("Failed to create sendQueue\n");
-	} else {
-		xTaskCreatePinnedToCore(commTask, "CommTask", 4096, NULL, configMAX_PRIORITIES-2, &commTaskHandle, 0);
+	if (sendQueue == NULL)
+	{
+		DBG_PRINT("Failed to create sendQueue\n");
 	}
+	else
+	{
+		xTaskCreatePinnedToCore(commTask, "CommTask", 4096, NULL, configMAX_PRIORITIES - 2, &commTaskHandle, 0);
+	}
+
 	// create receive queue and task
 	recvQueue = xQueueCreate(16, sizeof(RecvItem));
-	if (recvQueue == NULL) {
-		printf("Failed to create recvQueue\n");
-	} else {
-		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES-3, NULL, 1);
+	if (recvQueue == NULL)
+	{
+		DBG_PRINT("Failed to create recvQueue\n");
 	}
-	// create display queue and task
+	else
+	{
+		xTaskCreatePinnedToCore(recvTask, "RecvTask", 4096, NULL, configMAX_PRIORITIES - 3, NULL, 1);
+	}
+
+	// create display queue
 	displayQueue = xQueueCreate(4, sizeof(DisplayItem));
-	if (displayQueue == NULL) {
-		printf("Failed to create displayQueue\n");
-	} else {
-		// displayTask removed, handle in loop()
+	if (displayQueue == NULL)
+	{
+		DBG_PRINT("Failed to create displayQueue\n");
 	}
-	// setup()または初期化部で必ずbeaconTickerを起動
-	beaconTicker.attach_ms(TDMA_FRAME_MS, [](){
-		if (!beaconEnabled) return;
-		if (sendQueue == NULL) return;
-		SendItem item;
-		memcpy(item.addr, broadcastAddress, 6);
-		item.data[0] = 0xBE; item.data[1] = 0xAC; item.len = 2;
-		BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-		xQueueSendFromISR(sendQueue, &item, &xHigherPriorityTaskWoken);
-		if (xHigherPriorityTaskWoken == pdTRUE) portYIELD_FROM_ISR();
-		//printf("[SERVER] Beacon sent at %lu ms\n", millis());
-		//printf("%d\n", millis() - lastBeaconSentTime);
-		lastBeaconSentTime = millis();
-	});
 }
 
 void loop()
 {
-	// Check for button press to send commands
 	M5.update();
 
-	if (M5.BtnA.wasClicked()) {
-		beaconEnabled = !beaconEnabled;
-//		printf("beaconEnabled = %d\n", beaconEnabled);
-		if (beaconEnabled) {
-			sampleSeq = 0;
+	// Update LED according to whether all clients are connected and transfer state
+	bool allConnected = true;
+	for (int i = 0; i < NUM_CLIENTS; ++i)
+		if (!client_connected[i]) { allConnected = false; break; }
+	if (!allConnected)
+	{
+		// orange while waiting for all clients
+		fastled_leds[0] = CRGB(30, 15, 0);
+	}
+	else
+	{
+		// when all connected: green if stopped, yellow if transferring
+		if (transferEnabled)
 			fastled_leds[0] = CRGB(30, 30, 0);
-		} else {
+		else
 			fastled_leds[0] = CRGB(0, 30, 0);
+	}
+	FastLED.show();
+
+	if (M5.BtnA.wasClicked())
+	{
+		// Toggle transfer state and immediately notify clients via UDP
+		transferEnabled = !transferEnabled;
+		if (transferEnabled)
+		{
+			DBG_PRINT("Transfer ENABLED\n");
+			sampleSeq = 0;
+			// Send START to each client individually (with redundancy)
+			for (int c = 0; c < NUM_CLIENTS; ++c)
+			{
+				for (int rep = 0; rep < 3; ++rep)
+				{
+					sendControlToClient(c, true);
+					vTaskDelay(pdMS_TO_TICKS(10));
+				}
+			}
+		}
+		else
+		{
+			DBG_PRINT("Transfer DISABLED\n");
+			// Stop display queue and notify each client to stop
+			xQueueReset(displayQueue);
+			for (int c = 0; c < NUM_CLIENTS; ++c)
+			{
+				for (int rep = 0; rep < 3; ++rep)
+				{
+					sendControlToClient(c, false);
+					vTaskDelay(pdMS_TO_TICKS(10));
+				}
+			}
+			// Print average intervals for each client for the session that just ended
+			printAndResetIntervalAverages();
 		}
 		FastLED.show();
 	}
-	static uint8_t prevBeaconEnabled = 0;
-	if (prevBeaconEnabled != beaconEnabled) {
-		if (beaconEnabled == 0) {
-			xQueueReset(displayQueue);
-		}
-		prevBeaconEnabled = beaconEnabled;
-	}
-	// Handle display in loop
+
 	DisplayItem item;
-	if (xQueueReceive(displayQueue, &item, 0) == pdTRUE) {
-		if (beaconEnabled) {
-			char cAlternatingError = item.fAlternatingError ? '*' : ' ';
-			if (fAlternatingReceiveError == 1){
-				fastled_leds[0] = CRGB(30, 0, 0);
-			}
-			else{
-				fastled_leds[0] = CRGB(30, 30, 0);
-			}
-			FastLED.show();
-			for (int i = 0; i < 12; i++) {
-				if (!beaconEnabled) break;
-				printf("%c,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", cAlternatingError, item.tm/12, item.roll[i], item.pitch[i], item.yaw[i], item.roll[12+i], item.pitch[12+i], item.yaw[12+i]);
+	if (xQueueReceive(displayQueue, &item, 0) == pdTRUE)
+	{
+		if (transferEnabled)
+		{
+			for (int i = 0; i < 12; i++)
+			{
+				if (!transferEnabled)
+					break;
+				printf(",%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", item.tm / 12, item.q0[i], item.q1[i], item.q2[i], item.q3[i], item.q0[12 + i], item.q1[12 + i], item.q2[12 + i], item.q3[12 + i]);
 			}
 		}
 	}
-	// ESP-NOW server receives data via callback (onDataRecv)
-	// No polling needed, data is received asynchronously
-	delay(10);
+
+    delay(10);
 }
