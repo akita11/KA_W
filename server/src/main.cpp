@@ -1,7 +1,4 @@
 // KA_W Server
-// Configuration
-// KA_W Server
-// Configuration
 // PC--[USB]--KAW[S] <---[TCP]--> KAW[C]
 
 #define NUM_CLIENTS 2
@@ -40,7 +37,6 @@ typedef struct
 	float q2[24];
 	float q3[24];
 	uint32_t tm;
-	uint8_t fAlternatingError;
 } DisplayItem;
 
 static QueueHandle_t recvQueue = NULL;
@@ -49,20 +45,8 @@ static QueueHandle_t displayQueue = NULL;
 // Track per-client connection (set when data received from client)
 static bool client_connected[NUM_CLIENTS] = {0};
 
-// Throughput sample count
-#define SERVER_THROUGHPUT_SAMPLE 100
-
 volatile uint8_t transferEnabled = 0; // STARTで1, STOPで0
 
-volatile uint8_t fReceived = 0;
-volatile uint32_t prevReceiveTime = 0;
-volatile char prevClientID = 0;
-
-// データ保持用配列: CLIENT x 12サンプル の q0-q3
-float client_q0[NUM_CLIENTS][12];
-float client_q1[NUM_CLIENTS][12];
-float client_q2[NUM_CLIENTS][12];
-float client_q3[NUM_CLIENTS][12];
 // Per-client payload circular buffer to hold up to 5 recent payloads (each payload = 12 samples)
 #define PAYLOAD_BUFFER_DEPTH 5
 typedef struct {
@@ -74,13 +58,11 @@ typedef struct {
 static PayloadBuf payload_buffer[NUM_CLIENTS][PAYLOAD_BUFFER_DEPTH];
 static uint8_t payload_head[NUM_CLIENTS] = {0}; // next write index
 static uint8_t payload_count[NUM_CLIENTS] = {0}; // number of stored payloads (<=DEPTH)
-volatile uint32_t lastDisplayTime = 0;
 
 // FastLED fallback
 #define FALLBACK_NUM_LEDS 1
 static CRGB fastled_leds[FALLBACK_NUM_LEDS];
 static bool fastled_initialized = false;
-static int fastled_pin = -1;
 
 // UDP
 WiFiUDP udp;
@@ -93,43 +75,30 @@ const uint16_t UDP_PORT = 12345;
 
 // forward declaration
 static void printAndResetIntervalAverages();
+static bool allClientsConnected();
 
 #if defined(USE_TCP)
 WiFiServer tcpServer(UDP_PORT);
 #endif
 
-uint8_t nShowDebug = 0;
 uint32_t sampleSeq = 0;
 uint32_t t0 = 0;
-uint8_t fAlternatingReceiveError = 0;
-uint32_t lastReceiveTime = 0; // Track last receive time for SERVER
-uint16_t nThroughputSamples = 0;
-uint32_t previousThroughputSamplingTime = 0;
 // per-client last receive timestamp (ms)
 static uint32_t last_recv_ms[NUM_CLIENTS] = {0};
 // per-client interval accumulators (sum of intervals in ms and count)
 static uint64_t sum_intervals_ms[NUM_CLIENTS] = {0};
 static uint32_t count_intervals[NUM_CLIENTS] = {0};
 
+static bool allClientsConnected()
+{
+	for (int i = 0; i < NUM_CLIENTS; ++i)
+		if (!client_connected[i]) return false;
+	return true;
+}
+
 void processReceivedData(RecvItem item)
 {
 	uint32_t currentTime = millis();
-	// per-client elapsed will be computed below
-	// 受信元クライアントIDを先に表示してからペイロード内容を表示
-	char srcId = (item.len > 0) ? (char)item.data[0] : '?';
-	// print only elapsed ms per-client (computed after determining client index)
-	// placeholder message; exact elapsed printed below when client index known
-/*
-		for (int i = 0; i < item.len; i++)
-		{
-			char c = item.data[i];
-			if (c >= 32 && c <= 126)
-				putchar(c);
-			else
-				putchar('.');
-		}
-		putchar('\n');
-*/
 
 	char id = (item.len > 0) ? item.data[0] : '?';
 	// mark client as seen/connected and compute per-client elapsed
@@ -140,10 +109,7 @@ void processReceivedData(RecvItem item)
 		{
 			client_connected[cidx] = true;
 			DBG_PRINT("[SERVER] CLIENT %c marked connected\n", id);
-			// If all clients are now connected, set LED to green immediately
-			bool allConn = true;
-			for (int _i = 0; _i < NUM_CLIENTS; ++_i) if (!client_connected[_i]) { allConn = false; break; }
-			if (allConn)
+			if (allClientsConnected())
 			{
 				fastled_leds[0] = CRGB(0, 30, 0);
 				FastLED.show();
@@ -151,7 +117,6 @@ void processReceivedData(RecvItem item)
 		}
 		// compute per-client elapsed ms since previous receive
 		uint32_t elapsed_client_ms = (last_recv_ms[cidx] == 0) ? 0 : (currentTime - last_recv_ms[cidx]);
-		//printf("[SERVER] CLIENT %c elapsed %lu ms since previous receive, %d bytes\n", id, (unsigned long)elapsed_client_ms, item.len);
 		// accumulate interval only when transfer is active (between START and STOP)
 		if (transferEnabled && last_recv_ms[cidx] != 0)
 		{
@@ -162,7 +127,6 @@ void processReceivedData(RecvItem item)
 	}
 
 	// データパースと格納
-	//printf("received data(%d): %s\n", item.len, item.data);
 	for (uint8_t i = 0; i < 12; i++)
 	{
 		char sample[21];
@@ -186,12 +150,7 @@ void processReceivedData(RecvItem item)
 		float q2 = iq2 / 1000.0f;
 		float q3 = iq3 / 1000.0f;
 		int client_idx = id - '1'; // '1' -> 0, '2' -> 1
-		//printf("Client %c Sample %d: q0=%.3f q1=%.3f q2=%.3f q3=%.3f\n", id, i, q0, q1, q2, q3);
-		client_q0[client_idx][i] = q0;
-		client_q1[client_idx][i] = q1;
-		client_q2[client_idx][i] = q2;
-		client_q3[client_idx][i] = q3;
-		// also store into circular payload buffer
+		// store into circular payload buffer
 		payload_buffer[client_idx][payload_head[client_idx]].q0[i] = q0;
 		payload_buffer[client_idx][payload_head[client_idx]].q1[i] = q1;
 		payload_buffer[client_idx][payload_head[client_idx]].q2[i] = q2;
@@ -204,10 +163,6 @@ void processReceivedData(RecvItem item)
 		payload_head[cidx] = (payload_head[cidx] + 1) % PAYLOAD_BUFFER_DEPTH;
 		if (payload_count[cidx] < PAYLOAD_BUFFER_DEPTH) payload_count[cidx]++;
 	}
-	// (displaying combined payloads is handled below using per-client block buffers)
-	lastReceiveTime = currentTime;
-	prevReceiveTime = currentTime;
-	fReceived = (fReceived + 1) % 10;
 
 	// If this is CLIENT '2' and transfer is enabled, prepare a combined display item
 	if (id == '2' && transferEnabled)
@@ -215,7 +170,6 @@ void processReceivedData(RecvItem item)
 		DisplayItem dispItem;
 		dispItem.id = id;
 		dispItem.tm = 0;
-		dispItem.fAlternatingError = fAlternatingReceiveError;
 		// Determine latest payload index for each client
 		for (int c = 0; c < NUM_CLIENTS; ++c)
 		{
@@ -242,19 +196,13 @@ void processReceivedData(RecvItem item)
 				}
 			}
 		}
-		// compute tm using micros() delta as before
+		// compute tm using micros() delta
 		uint32_t t1 = micros();
 		dispItem.tm = (t0 == 0) ? 0 : (t1 - t0);
 		t0 = t1;
 		// enqueue for display
 		xQueueSend(displayQueue, &dispItem, 0);
-		lastDisplayTime = currentTime;
 	}
-
-	// スループット計算（オプション）
-	// prevReceiveTime = currentTime;
-	// nThroughputSamples++;
-	// if (nThroughputSamples == SERVER_THROUGHPUT_SAMPLE) { ... }
 }
 
 // Print per-client average receive interval (ms) for the last START..STOP session and reset accumulators
@@ -286,7 +234,6 @@ void recvTask(void *pvParameters)
 	RecvItem item;
 	for (;;)
 	{
-		// Support both UDP and TCP server modes
 #if defined(USE_TCP)
 		WiFiClient c = tcpServer.available();
 		if (c)
@@ -295,7 +242,6 @@ void recvTask(void *pvParameters)
 			if (len > 0)
 			{
 				item.len = len;
-				// If this is a STOP control (maybe received via UDP/TCP loopback), print averages and reset
 				if (item.len == 2 && (uint8_t)item.data[0] == STOP0 && (uint8_t)item.data[1] == STOP1)
 				{
 					transferEnabled = 0;
@@ -312,7 +258,6 @@ void recvTask(void *pvParameters)
 			if (len > 0)
 			{
 				item.len = len;
-				// If this is a STOP control (server may receive its own broadcast), print averages and reset
 				if (item.len == 2 && (uint8_t)item.data[0] == STOP0 && (uint8_t)item.data[1] == STOP1)
 				{
 					transferEnabled = 0;
@@ -322,7 +267,7 @@ void recvTask(void *pvParameters)
 			}
 		}
 #endif
-		vTaskDelay(pdMS_TO_TICKS(10)); // Small delay
+		vTaskDelay(pdMS_TO_TICKS(10));
 	}
 }
 
@@ -346,9 +291,8 @@ void commTask(void *pvParameters)
 	{
 		if (xQueueReceive(sendQueue, &item, portMAX_DELAY) == pdTRUE)
 		{
-			vTaskDelay(pdMS_TO_TICKS(2)); // Small delay before send
+			vTaskDelay(pdMS_TO_TICKS(2));
 #if defined(USE_TCP)
-			// In TCP mode, send the queued payload to each client individually
 			for (int c = 0; c < NUM_CLIENTS; ++c)
 			{
 				IPAddress clientIP(192, 168, 4, c + 2);
@@ -365,7 +309,6 @@ void commTask(void *pvParameters)
 				vTaskDelay(pdMS_TO_TICKS(2));
 			}
 #else
-			// Default behavior: send queued item as UDP broadcast
 			IPAddress bc(192, 168, 4, 255);
 			udp.beginPacket(bc, UDP_PORT);
 			udp.write(item.data, item.len);
@@ -375,10 +318,10 @@ void commTask(void *pvParameters)
 	}
 }
 
-// Send control (START/STOP) to a specific client IP (repeat logic executed by caller)
+// Send control (START/STOP) to a specific client IP
 static void sendControlToClient(int client_idx, bool isStart)
 {
-	IPAddress clientIP(192, 168, 4, client_idx + 2); // client_idx 0 -> .2
+	IPAddress clientIP(192, 168, 4, client_idx + 2);
 	uint8_t msg[2];
 	msg[0] = isStart ? START0 : STOP0;
 	msg[1] = isStart ? START1 : STOP1;
@@ -388,17 +331,13 @@ static void sendControlToClient(int client_idx, bool isStart)
 	{
 		tcp.write(msg, 2);
 		tcp.stop();
-		// Mark this client as connected when TCP connect succeeds
 		if (client_idx >= 0 && client_idx < NUM_CLIENTS)
 		{
-				if (!client_connected[client_idx])
-				{
-					client_connected[client_idx] = true;
-					DBG_PRINT("[SERVER] CLIENT %d marked connected (via TCP connect)\n", client_idx + 1);
-				// If all clients are now connected, set LED to green immediately
-				bool allConn = true;
-				for (int _i = 0; _i < NUM_CLIENTS; ++_i) if (!client_connected[_i]) { allConn = false; break; }
-				if (allConn)
+			if (!client_connected[client_idx])
+			{
+				client_connected[client_idx] = true;
+				DBG_PRINT("[SERVER] CLIENT %d marked connected (via TCP connect)\n", client_idx + 1);
+				if (allClientsConnected())
 				{
 					fastled_leds[0] = CRGB(0, 30, 0);
 					FastLED.show();
@@ -421,8 +360,6 @@ static void initFastLEDFallback()
 {
 	if (fastled_initialized)
 		return;
-	// Use ATOMS3 Lite LED pin 35
-	fastled_pin = 35;
 	FastLED.addLeds<WS2812B, 35, GRB>(fastled_leds, FALLBACK_NUM_LEDS);
 	FastLED.setBrightness(64);
 	fastled_initialized = true;
@@ -430,52 +367,44 @@ static void initFastLEDFallback()
 	FastLED.show();
 }
 
-// beacon ticker and periodic beaconing removed; server uses START/STOP control
-
 void setup()
 {
 	M5.begin();
-	Serial.setTxBufferSize(2048); // Increase TX buffer to reduce blocking
+	Serial.setTxBufferSize(2048);
 
-	// Initialize FastLED fallback unconditionally (do not use M5.Led)
 	initFastLEDFallback();
-	// ensure initial color is green (stopped)
 	fastled_leds[0] = CRGB(0, 30, 0);
 	FastLED.show();
 
-	// Initialize WiFi in AP mode for TCP server
+	// Initialize WiFi in AP mode
 	WiFi.mode(WIFI_AP);
-	WiFi.softAP("KAW_Server", "password123"); // SSID and password
+	WiFi.softAP("KAW_Server", "password123");
 	IPAddress IP = WiFi.softAPIP();
 	DBG_PRINT("AP IP address: %s\n", IP.toString().c_str());
 
 	// Wait for all clients to connect to the AP before proceeding
-	// Indicate waiting with orange LED
 	fastled_leds[0] = CRGB(30, 15, 0); // orange
 	FastLED.show();
 	while (WiFi.softAPgetStationNum() < NUM_CLIENTS)
 	{
-		// brief delay while waiting
 		delay(200);
 	}
-	// all clients are connected -> set green
 	fastled_leds[0] = CRGB(0, 30, 0);
 	FastLED.show();
 
-	// Start UDP listener
 	// Start network listener depending on transport
 #if defined(USE_TCP)
-		tcpServer.begin();
-		DBG_PRINT("TCP server started on port %d\n", UDP_PORT);
+	tcpServer.begin();
+	DBG_PRINT("TCP server started on port %d\n", UDP_PORT);
 #else
-		if (!udp.begin(UDP_PORT))
-		{
-			DBG_PRINT("Failed to start UDP on port %d\n", UDP_PORT);
-		}
-		else
-		{
-			DBG_PRINT("UDP server started on port %d\n", UDP_PORT);
-		}
+	if (!udp.begin(UDP_PORT))
+	{
+		DBG_PRINT("Failed to start UDP on port %d\n", UDP_PORT);
+	}
+	else
+	{
+		DBG_PRINT("UDP server started on port %d\n", UDP_PORT);
+	}
 #endif
 	vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -513,34 +442,27 @@ void loop()
 {
 	M5.update();
 
-	// Update LED according to whether all clients are connected and transfer state
-	bool allConnected = true;
-	for (int i = 0; i < NUM_CLIENTS; ++i)
-		if (!client_connected[i]) { allConnected = false; break; }
-	if (!allConnected)
+	// Update LED according to connection and transfer state
+	if (!allClientsConnected())
 	{
-		// orange while waiting for all clients
-		fastled_leds[0] = CRGB(30, 15, 0);
+		fastled_leds[0] = CRGB(30, 15, 0); // orange while waiting
 	}
 	else
 	{
-		// when all connected: green if stopped, yellow if transferring
 		if (transferEnabled)
-			fastled_leds[0] = CRGB(30, 30, 0);
+			fastled_leds[0] = CRGB(30, 30, 0); // yellow if transferring
 		else
-			fastled_leds[0] = CRGB(0, 30, 0);
+			fastled_leds[0] = CRGB(0, 30, 0); // green if stopped
 	}
 	FastLED.show();
 
 	if (M5.BtnA.wasClicked())
 	{
-		// Toggle transfer state and immediately notify clients via UDP
 		transferEnabled = !transferEnabled;
 		if (transferEnabled)
 		{
 			DBG_PRINT("Transfer ENABLED\n");
 			sampleSeq = 0;
-			// Send START to each client individually (with redundancy)
 			for (int c = 0; c < NUM_CLIENTS; ++c)
 			{
 				for (int rep = 0; rep < 3; ++rep)
@@ -553,7 +475,6 @@ void loop()
 		else
 		{
 			DBG_PRINT("Transfer DISABLED\n");
-			// Stop display queue and notify each client to stop
 			xQueueReset(displayQueue);
 			for (int c = 0; c < NUM_CLIENTS; ++c)
 			{
@@ -563,7 +484,6 @@ void loop()
 					vTaskDelay(pdMS_TO_TICKS(10));
 				}
 			}
-			// Print average intervals for each client for the session that just ended
 			printAndResetIntervalAverages();
 		}
 		FastLED.show();
@@ -583,5 +503,5 @@ void loop()
 		}
 	}
 
-    delay(10);
+	delay(10);
 }
